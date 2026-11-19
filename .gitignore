@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+snow.ico
+snow.icns
+snow.iconset/
+snow.png
+.buildvenv/
+*.log

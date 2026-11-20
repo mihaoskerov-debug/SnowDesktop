@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -167,6 +167,23 @@ KIND_COLORS = {"battery": ("#2BC48A", "#0B8C8F"), "calendar": ("#FF6A5C", "#F29A
                "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9"),
                "music": ("#F2B705", "#E06A1B")}
 OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
+
+
+_ERR_SEEN = {}
+
+
+def log_error(where):
+    """Ошибка -> %APPDATA%\\SnowWidgets\\widgets_error.log (одна и та же - не чаще раза в минуту)."""
+    tb = traceback.format_exc()
+    key = where + tb[-200:]
+    if time.time() - _ERR_SEEN.get(key, 0) < 60:
+        return
+    _ERR_SEEN[key] = time.time()
+    try:
+        with open(os.path.join(DATA_DIR, "widgets_error.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s  v%s  %s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), APP_VERSION, where, tb))
+    except Exception:
+        pass
 
 
 def font(px, weight=NORMAL):
@@ -1310,7 +1327,8 @@ class Card(QWidget):
             if th["mode"] == "winter":
                 self.paint_snowcap(p, r)
         except Exception:
-            traceback.print_exc()
+            log_error("рисование виджета %s" % self.KIND)
+            self.want_frame(1000)
         p.restore()
         p.setBrush(Qt.BrushStyle.NoBrush)
         if neon:
@@ -2965,10 +2983,20 @@ class MediaService(QObject):
                     props = await asyncio.wait_for(s.try_get_media_properties_async(), 3)
                     title = (props.title or "").strip()
                     if title:
-                        playing = self._status(s) == 4
+                        status = self._status(s)
                         tl = s.get_timeline_properties()
                         app = s.source_app_user_model_id or ""
                         key = (title, props.artist, app)
+                        # не все плееры честно сообщают "играет" - смотрим ещё, идёт ли время трека
+                        raw = _secs(tl.position)
+                        prev = getattr(self, "_prev_pos", None)
+                        moving = bool(prev and prev[0] == key and abs(raw - prev[1]) > 0.3)
+                        self._prev_pos = (key, raw)
+                        playing = status == 4 or (moving and status not in (3, 5))
+                        sig = (app, status, title)
+                        if sig != getattr(self, "_logged", None):
+                            self._logged = sig
+                            self.log("плеер: %s | статус %s (4 - играет, 5 - пауза) | %s" % (app, status, title))
                         if key != last_key:
                             last_key = key
                             cover = await self._thumb(props, ss)
@@ -2984,6 +3012,7 @@ class MediaService(QObject):
                         self._last_app = app
                         st = {"title": title, "artist": props.artist or props.album_artist or "",
                               "album": props.album_title or "", "app": app, "playing": playing, "pos": pos,
+                              "status": status,
                               "dur": _secs(tl.end_time) - _secs(tl.start_time), "stamp": time.time(),
                               "cover": cover, "key": key}
                 fails = 0
@@ -3170,9 +3199,14 @@ class MusicCard(Card):
         self.prev_blur = None
 
     # ----- живые величины: громкость, вращение -----
-    def _tick(self, playing):
+    def _tick(self, playing, has_track=True):
         t = time.time()
-        peak = _METER.peak() if playing else 0.0
+        peak = _METER.peak() if has_track else 0.0
+        if not playing and peak is not None and peak > 0.03 and has_track:
+            playing = True                                  # звук идёт - значит, играет
+        self._vis_playing = playing
+        if not playing:
+            peak = 0.0
         if peak is None:                                    # нет данных о звуке - мягкий "ритм" ~120 уд/мин
             beat = max(0.0, math.sin(t * math.tau * 1.95)) ** 4
             peak = 0.38 + 0.42 * beat + 0.08 * math.sin(t * 7.3) + 0.05 * math.sin(t * 13.1)
@@ -3327,7 +3361,7 @@ class MusicCard(Card):
         if len(self.bars) != n:
             self.bars = [0.3] * n
         t = time.time()
-        playing = st["playing"] and self.animated
+        playing = getattr(self, "_vis_playing", st["playing"]) and self.animated
         mid = rc.center().y()
         played = QLinearGradient(rc.x(), 0, rc.right(), 0)
         played.setColorAt(0, YA_YELLOW)
@@ -3411,7 +3445,9 @@ class MusicCard(Card):
         st = self.media.state
         size = self.cfg["size"]
         playing = bool(st and st.get("title") and st["playing"])
-        slide = self._tick(playing)
+        # звук по громкости считаем "игрой", только если плеер не сказал прямо "пауза"/"стоп"
+        slide = self._tick(playing, bool(st and st.get("title")) and (st or {}).get("status") not in (3, 5))
+        playing = self._vis_playing
         if not st or not st.get("title"):
             R = 40 if size != "s" else 36
             cy = r.y() + (r.height() * 0.34 if size != "l" else 120)
@@ -3531,6 +3567,16 @@ _MUTEX = None
 
 
 def single_instance():
+    if "--restart" in sys.argv:                 # перезапуск: ждём, пока старая копия закроется
+        for _ in range(40):
+            if _single_instance_once():
+                return True
+            time.sleep(0.25)
+        return False
+    return _single_instance_once()
+
+
+def _single_instance_once():
     global _MUTEX
     if not IS_WIN:
         return True
@@ -3540,6 +3586,8 @@ def single_instance():
         k32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
         _MUTEX = k32.CreateMutexW(None, False, "Local\\SnowWidgets_v1")
         if ctypes.get_last_error() == 183:
+            k32.CloseHandle(ctypes.c_void_p(_MUTEX))
+            _MUTEX = None
             return False
     except Exception:
         pass
@@ -3832,12 +3880,15 @@ class Manager(QObject):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         tray = QSystemTrayIcon(make_icon(), self)
-        tray.setToolTip("Виджеты рабочего стола")
+        tray.setToolTip("Виджеты рабочего стола v" + APP_VERSION)
         menu = QMenu()
 
         def rebuild():
             menu.clear()
             menu.setStyleSheet(self.menu_css())
+            head = menu.addAction("Виджеты, версия " + APP_VERSION)
+            head.setEnabled(False)
+            menu.addSeparator()
             self.fill_common_menu(menu)
             menu.addAction("Обновить заряд устройств").triggered.connect(self.battery.refresh)
             menu.addSeparator()
@@ -3849,6 +3900,7 @@ class Manager(QObject):
             menu.addAction("Папка с настройками").triggered.connect(
                 lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR)))
             menu.addSeparator()
+            menu.addAction("Перезапустить (после обновления)").triggered.connect(self.restart)
             menu.addAction("Выход").triggered.connect(self.quit)
 
         rebuild()
@@ -3856,6 +3908,21 @@ class Manager(QObject):
         tray.setContextMenu(menu)
         tray.show()
         self.tray, self._menu = tray, menu
+
+    def restart(self):
+        """Запустить программу заново - новая копия дождётся, пока эта закроется."""
+        args = [sys.executable] + ([] if FROZEN else [os.path.abspath(__file__)]) + ["--restart"]
+        try:
+            exe = args[0]
+            if IS_WIN and not FROZEN:
+                pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                if os.path.exists(pw):
+                    args[0] = pw
+            subprocess.Popen(args, creationflags=NO_WINDOW if IS_WIN else 0)
+        except Exception:
+            log_error("перезапуск")
+            return
+        self.quit()
 
     def quit(self):
         self._save_timer.stop()
@@ -3867,7 +3934,9 @@ class Manager(QObject):
 
 def main():
     if not single_instance():
-        msgbox("Виджеты уже запущены - ищи значок в трее (возле часов).")
+        msgbox("Виджеты уже запущены - ищи значок в трее (возле часов).\n\n"
+               "Если ты обновил программу: значок в трее -> «Перезапустить (после обновления)» "
+               "или «Выход», а потом запусти снова. Иначе продолжит работать старая версия.")
         return 0
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

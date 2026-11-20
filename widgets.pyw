@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.9"
+APP_VERSION = "1.10"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -2857,7 +2857,8 @@ def media_key(name):
 
 def app_title(aumid):
     a = (aumid or "").lower()
-    for key, title in (("yandex", "Яндекс Музыка"), ("spotify", "Spotify"), ("chrome", "Браузер Chrome"),
+    for key, title in (("music.yandex", "Яндекс Музыка"), ("yandexmusic", "Яндекс Музыка"),
+                       ("yandex.music", "Яндекс Музыка"), ("яндекс", "Яндекс Музыка"), ("yandex", "Яндекс"), ("spotify", "Spotify"), ("chrome", "Браузер Chrome"),
                        ("msedge", "Браузер Edge"), ("firefox", "Браузер Firefox"), ("opera", "Браузер Opera"),
                        ("browser", "Яндекс Браузер"), ("vk", "VK Музыка"), ("zune", "Музыка Windows"),
                        ("media", "Медиаплеер")):
@@ -3018,32 +3019,38 @@ class MediaService(QObject):
         except Exception:
             return -1
 
+    @staticmethod
+    def is_yandex(aumid):
+        a = (aumid or "").lower()
+        return any(k in a for k in ("yandex", "яндекс", "music.yandex"))
+
     def _pick(self, mgr):
-        """Какой плеер показывать: сначала играющая Яндекс Музыка, потом любой играющий,
-        потом тот, что показывали в прошлый раз, потом "текущий" по мнению Windows."""
+        """Какой плеер показывать: сначала играющая Яндекс Музыка, потом любой играющий плеер,
+        потом тот, что показывали в прошлый раз, потом "текущий" по мнению Windows.
+        Если Windows знает хоть один плеер - что-то показываем всегда (не отбрасываем "чужие")."""
         try:
             sessions = list(mgr.get_sessions() or [])
         except Exception:
             sessions = []
-        only_ya = bool(self.mgr.cfg.get("music_only_yandex"))
         aid = lambda s: (getattr(s, "source_app_user_model_id", "") or "")
-        ya = [s for s in sessions if "yandex" in aid(s).lower()]
-        pool = ya if (ya or only_ya) else sessions
-        playing = [s for s in pool if self._status(s) == 4]
-        if playing:
-            return playing[0]
+        self.session_names = [aid(s) for s in sessions]
+        if not sessions:
+            return None
+        ya = [s for s in sessions if self.is_yandex(aid(s))]
+        for pool in (ya, sessions):
+            playing = [s for s in pool if self._status(s) == 4]
+            if playing:
+                return playing[0]
         last = getattr(self, "_last_app", None)
-        for s in pool:
+        for s in sessions:
             if aid(s) == last:
                 return s
-        if only_ya:
-            return ya[0] if ya else None
         if ya:
             return ya[0]
         try:
-            return mgr.get_current_session() or (sessions[0] if sessions else None)
+            return mgr.get_current_session() or sessions[0]
         except Exception:
-            return sessions[0] if sessions else None
+            return sessions[0]
 
     async def _poll(self, mods, gen):
         import asyncio
@@ -3060,12 +3067,8 @@ class MediaService(QObject):
                 self.session = s
                 if s is None:
                     self._log_sessions(mgr, "нет подходящего плеера")
-                    try:
-                        n = len(list(mgr.get_sessions() or []))
-                    except Exception:
-                        n = 0
-                    self.reason = ("Windows не видит ни одного плеера" if n == 0 else
-                                   "Яндекс Музыка не найдена среди плееров Windows")
+                    self.reason = ("Windows не знает ни одного плеера: приложение не передаёт ей трек "
+                                   "(проверь - видно ли название песни у ползунка громкости)")
                 if s is not None:
                     props = await asyncio.wait_for(s.try_get_media_properties_async(), 3)
                     title = (props.title or "").strip()
@@ -3719,6 +3722,8 @@ class MusicCard(Card):
                  "Режим пластинки: %s" % ("всегда" if self.cfg.get("spin") == "always" else "когда играет"),
                  "Ошибка связи с плеером: %s" % (self.media.error or "нет"),
                  "Почему нет названия: %s" % (self.media.reason or "-"),
+                 "Плееры, которые знает Windows: %s" % (", ".join(getattr(self.media, "session_names", []) or [])
+                                                         or "ни одного"),
                  "", "Журналы: " + DATA_DIR]
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(QMessageBox.Icon.Information, "Музыка - диагностика", "\n".join(lines))
@@ -3735,10 +3740,7 @@ class MusicCard(Card):
         a.setChecked(self.cfg.get("spin") == "always")
         a.toggled.connect(lambda v: self.set_opt("spin", "always" if v else None))
         menu.addAction("Диагностика...").triggered.connect(self.diagnose)
-        a = menu.addAction("Только Яндекс Музыка (не другие плееры)")
-        a.setCheckable(True)
-        a.setChecked(bool(self.mgr.cfg.get("music_only_yandex")))
-        a.toggled.connect(lambda v: self.mgr.set_opt("music_only_yandex", bool(v)))
+
 
 
 KINDS = {c.KIND: c for c in (WeatherCard, MusicCard, BatteryCard, PhotoCard, CalendarCard, ClockCard,

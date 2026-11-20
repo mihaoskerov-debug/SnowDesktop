@@ -35,7 +35,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -167,7 +167,7 @@ KIND_COLORS = {"battery": ("#2BC48A", "#0B8C8F"), "calendar": ("#FF6A5C", "#F29A
                "clock": ("#5B5BD6", "#A35BE0"), "system": ("#2D7FF9", "#2EC0EE"),
                "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9"),
                "music": ("#F2B705", "#E06A1B"), "claude": ("#D97757", "#A8553A"),
-               "discord": ("#5865F2", "#4248C9")}
+               "discord": ("#5865F2", "#4248C9"), "notify": ("#5865F2", "#4248C9")}
 OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
 
 
@@ -2941,17 +2941,32 @@ class MediaService(QObject):
         except Exception:
             self._emit({"error": "Не удалось подключиться к плееру Windows"})
 
+    def log(self, msg):
+        """Журнал ошибок связи с плеером: %APPDATA%\\SnowWidgets\\music.log (последние 300 строк)."""
+        try:
+            path = os.path.join(DATA_DIR, "music.log")
+            lines = []
+            if os.path.exists(path):
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().splitlines()[-299:]
+            lines.append(time.strftime("%Y-%m-%d %H:%M:%S ") + msg)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
     async def _thumb(self, props, ss):
+        import asyncio
         try:
             ref = props.thumbnail
             if ref is None:
                 return None
-            stream = await ref.open_read_async()
+            stream = await asyncio.wait_for(ref.open_read_async(), 4)
             size = int(stream.size)
-            if not size:
+            if not size or size > 20 * 1024 * 1024:
                 return None
             buf = ss.Buffer(size)
-            res = await stream.read_async(buf, size, ss.InputStreamOptions.READ_AHEAD)
+            res = await asyncio.wait_for(stream.read_async(buf, size, ss.InputStreamOptions.READ_AHEAD), 4)
             try:
                 data = bytes(memoryview(res))
             except Exception:
@@ -2961,62 +2976,110 @@ class MediaService(QObject):
                 data = bytes(arr)
             img = QImage.fromData(data)
             return None if img.isNull() else img
-        except Exception:
+        except Exception as ex:
+            self.log("обложка: %r" % (ex,))
             return None
 
+    @staticmethod
+    def _status(s):
+        try:
+            return int(s.get_playback_info().playback_status)
+        except Exception:
+            return -1
+
     def _pick(self, mgr):
-        sessions = list(mgr.get_sessions() or [])
-        ya = [s for s in sessions if "yandex" in (s.source_app_user_model_id or "").lower()]
+        """Какой плеер показывать: сначала играющая Яндекс Музыка, потом любой играющий,
+        потом тот, что показывали в прошлый раз, потом "текущий" по мнению Windows."""
+        try:
+            sessions = list(mgr.get_sessions() or [])
+        except Exception:
+            sessions = []
+        only_ya = bool(self.mgr.cfg.get("music_only_yandex"))
+        aid = lambda s: (getattr(s, "source_app_user_model_id", "") or "")
+        ya = [s for s in sessions if "yandex" in aid(s).lower()]
+        pool = ya if (ya or only_ya) else sessions
+        playing = [s for s in pool if self._status(s) == 4]
+        if playing:
+            return playing[0]
+        last = getattr(self, "_last_app", None)
+        for s in pool:
+            if aid(s) == last:
+                return s
+        if only_ya:
+            return ya[0] if ya else None
         if ya:
-            playing = [s for s in ya if int(s.get_playback_info().playback_status) == 4]
-            return (playing or ya)[0]
-        if self.mgr.cfg.get("music_only_yandex"):
-            return None
-        return mgr.get_current_session() or (sessions[0] if sessions else None)
+            return ya[0]
+        try:
+            return mgr.get_current_session() or (sessions[0] if sessions else None)
+        except Exception:
+            return sessions[0] if sessions else None
 
     async def _poll(self, mods):
         import asyncio
         mc, ss = mods
-        mgr = await mc.GlobalSystemMediaTransportControlsSessionManager.request_async()
-        last_key, cover = None, None
+        mgr = None
+        last_key, cover, fails = None, None, 0
         while True:
             st = None
             try:
+                if mgr is None or fails >= 5:              # после череды ошибок подключаемся заново
+                    mgr = await asyncio.wait_for(mc.GlobalSystemMediaTransportControlsSessionManager.request_async(), 8)
+                    fails = 0
                 s = self._pick(mgr)
                 self.session = s
                 if s is not None:
-                    props = await s.try_get_media_properties_async()
-                    info = s.get_playback_info()
-                    tl = s.get_timeline_properties()
-                    key = (props.title, props.artist, s.source_app_user_model_id)
-                    if key != last_key:
-                        last_key = key
-                        cover = await self._thumb(props, ss)
-                    playing = int(info.playback_status) == 4
-                    pos = _secs(tl.position) - _secs(tl.start_time)
-                    try:
-                        lu = tl.last_updated_time
-                        if playing and lu is not None and lu.year > 2000:
-                            age = (datetime.datetime.now(datetime.timezone.utc) - lu).total_seconds()
-                            if 0 < age < 6 * 3600:
-                                pos += age
-                    except Exception:
-                        pass
-                    st = {"title": props.title or "", "artist": props.artist or props.album_artist or "",
-                          "album": props.album_title or "", "app": s.source_app_user_model_id or "",
-                          "playing": playing, "pos": pos, "dur": _secs(tl.end_time) - _secs(tl.start_time),
-                          "stamp": time.time(), "cover": cover, "key": key}
-            except Exception:
-                st = None
+                    props = await asyncio.wait_for(s.try_get_media_properties_async(), 3)
+                    title = (props.title or "").strip()
+                    if title:
+                        playing = self._status(s) == 4
+                        tl = s.get_timeline_properties()
+                        app = s.source_app_user_model_id or ""
+                        key = (title, props.artist, app)
+                        if key != last_key:
+                            last_key = key
+                            cover = await self._thumb(props, ss)
+                        pos = _secs(tl.position) - _secs(tl.start_time)
+                        try:
+                            lu = tl.last_updated_time
+                            if playing and lu is not None and lu.year > 2000:
+                                age = (datetime.datetime.now(datetime.timezone.utc) - lu).total_seconds()
+                                if 0 < age < 6 * 3600:
+                                    pos += age
+                        except Exception:
+                            pass
+                        self._last_app = app
+                        st = {"title": title, "artist": props.artist or props.album_artist or "",
+                              "album": props.album_title or "", "app": app, "playing": playing, "pos": pos,
+                              "dur": _secs(tl.end_time) - _secs(tl.start_time), "stamp": time.time(),
+                              "cover": cover, "key": key}
+                fails = 0
+            except Exception as ex:
+                fails += 1
+                self.log("опрос: %r" % (ex,))
+                st = "keep"                                 # временная ошибка - не стираем трек с экрана
             self._emit({"state": st})
             await asyncio.sleep(1.0)
 
     def _on(self, payload):
         if "error" in payload:
             self.error = payload["error"]
-        else:
-            self.error = None
-            self.state = payload["state"]
+            self.updated.emit()
+            return
+        self.error = None
+        st = payload["state"]
+        if st == "keep":
+            return
+        if st is None and self.state:
+            # плеер пропал (приложение закрыли, вкладку поставили на паузу) - показываем последний трек
+            # как остановленный ещё 30 минут, а не пустой виджет
+            if time.time() - self.state.get("seen", self.state["stamp"]) < 30 * 60:
+                if self.state["playing"]:
+                    self.state = dict(self.state, playing=False, pos=self.position(), stamp=time.time())
+                    self.updated.emit()
+                return
+        if st is not None:
+            st["seen"] = time.time()
+        self.state = st
         self.updated.emit()
 
     # ----- команды -----
@@ -3297,7 +3360,8 @@ class ClaudeCard(Card):
         self.tok = 0
         self._style_key = None
         self.view = QTextBrowser(self)
-        self.view.setOpenExternalLinks(True)
+        self.view.setOpenLinks(False)
+        self.view.anchorClicked.connect(self._link)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.view.viewport().setAutoFillBackground(False)
         self.input = QLineEdit(self)
@@ -3345,14 +3409,30 @@ class ClaudeCard(Card):
                                  % (field, fg, border, FONT, CLAUDE_ORANGE.name()))
         self._fg2 = fg2
         link = "#8A3B1F" if light else "#F0A07E"
-        self._link = QColor(link)
+        self._link_col = QColor(link)
         self.render()
 
     def render(self):
         th = self.theme
         fg2 = th["fg2"].name()
         parts = []
-        if not self.msgs and not self.busy:
+        if self.mode() == "web":
+            where = {"panel": "в окошке рядом с виджетом", "app": "в приложении Claude",
+                     "browser": "в браузере"}[self.open_in()]
+            if self.cfg["size"] == "m":
+                parts.append("Напиши вопрос и нажми Enter - откроется claude.ai %s под твоим аккаунтом." % where)
+            else:
+                parts.append("**Claude без API-ключа.** Напиши вопрос внизу и нажми Enter - он откроется на claude.ai "
+                             "%s, под твоим аккаунтом Claude (бесплатным или с подпиской). Войти нужно один раз."
+                             % where)
+            if self.cfg["size"] != "m":
+                asked = self.cfg.get("recent") or []
+                if asked:
+                    parts.append("**Недавние вопросы** (нажми, чтобы спросить снова):")
+                    parts.append("\n".join("- [%s](snowask:%d)" % (q.replace("[", "(").replace("]", ")")[:80], i)
+                                           for i, q in enumerate(asked)))
+                parts.append("*Где открывать и режим с API-ключом - правая кнопка по заголовку виджета.*")
+        elif not self.msgs and not self.busy:
             if not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY") and self.cfg["size"] == "m":
                 parts.append("**Нужен API-ключ Claude.** Правая кнопка по виджету → «API-ключ Claude...». "
                              "Создать ключ: [platform.claude.com](https://platform.claude.com/settings/keys)")
@@ -3375,7 +3455,7 @@ class ClaudeCard(Card):
             parts.append("<p style='color:#FF6B6B'>%s</p>" % self.error)
         app = QApplication.instance()                 # Markdown берёт цвет ссылок из палитры приложения
         pal = app.palette()
-        link = getattr(self, "_link", None) or QColor("#F0A07E")
+        link = getattr(self, "_link_col", None) or QColor("#F0A07E")
         pal.setColor(QPalette.ColorRole.Link, link)
         pal.setColor(QPalette.ColorRole.LinkVisited, link)
         app.setPalette(pal)
@@ -3383,12 +3463,57 @@ class ClaudeCard(Card):
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
+    def _link(self, url):
+        u = url.toString()
+        if u.startswith("snowask:"):
+            try:
+                self.ask_web((self.cfg.get("recent") or [])[int(u[8:])])
+            except (ValueError, IndexError):
+                pass
+        else:
+            QDesktopServices.openUrl(url)
+
     def api_key(self):
         return secret_reveal(self.mgr.cfg.get("claude_key"))
+
+    def mode(self):
+        """web - через claude.ai под своим аккаунтом (без ключа), api - через API-ключ."""
+        m = self.cfg.get("mode")
+        if m in ("web", "api"):
+            return m
+        return "api" if (self.api_key() or os.environ.get("ANTHROPIC_API_KEY")) else "web"
+
+    def open_in(self):
+        o = self.cfg.get("open_in")
+        if o in ("panel", "app", "browser"):
+            return o
+        return "panel" if web_engine() is not None else "app"
+
+    def ask_web(self, q=""):
+        where = self.open_in()
+        if where == "panel":
+            panel = self.mgr.claude_panel()
+            if panel is not None:
+                panel.open(claude_url(q), near=self.frameGeometry())
+                return
+            where = "app"
+        if where == "app":
+            open_target("claude://claude.ai/new" + (("?q=" + urllib.parse.quote(q)) if q else ""), claude_url(q))
+        else:
+            open_target(claude_url(q))
 
     # ----- запрос -----
     def send(self):
         q = self.input.text().strip()
+        if self.mode() == "web":
+            self.input.clear()
+            if q:
+                recent = [x for x in (self.cfg.get("recent") or []) if x != q]
+                self.cfg["recent"] = ([q] + recent)[:6]
+                self.mgr.save()
+                self.render()
+            self.ask_web(q)
+            return
         if not q or self.busy:
             return
         if not DEMO and not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -3493,6 +3618,7 @@ class ClaudeCard(Card):
                                        QLineEdit.EchoMode.Password)
         if ok and key.strip():
             self.mgr.set_opt("claude_key", secret_protect(key.strip()))
+            self.set_opt("mode", "api")
             self.render()
 
     # ----- рисование -----
@@ -3525,22 +3651,45 @@ class ClaudeCard(Card):
         c = nb.center()
         p.drawLine(QPointF(c.x() - 5, c.y()), QPointF(c.x() + 5, c.y()))
         p.drawLine(QPointF(c.x(), c.y() - 5), QPointF(c.x(), c.y() + 5))
-        self.hit(nb, self.new_chat)
-        text(p, QRectF(r.right() - 200, r.y() + 12, 150, 24), "Opus 5.5", font(11), th["fg2"], AR | AVC)
+        self.hit(nb, self.new_chat if self.mode() == "api" else (lambda: self.ask_web("")))
+        text(p, QRectF(r.right() - 200, r.y() + 12, 150, 24), "Opus 5.5" if self.mode() == "api" else "claude.ai",
+             font(11), th["fg2"], AR | AVC)
 
     def clicked(self, pos):
         if self.cfg["size"] == "s":
-            self.activate()
+            self.ask_web("") if self.mode() == "web" else self.activate()
         else:
             self.activateWindow()
             self.input.setFocus()
 
     def activate(self):
+        if self.mode() == "web":
+            self.ask_web("")
+            return
         local = os.environ.get("LOCALAPPDATA", "")
         open_target(os.path.join(local, "AnthropicClaude", "claude.exe"), "https://claude.ai/new")
 
     def extra_menu(self, menu):
-        menu.addAction("Новый чат").triggered.connect(self.new_chat)
+        mm = menu.addMenu("Режим")
+        grp = QActionGroup(mm)
+        for key, label in (("web", "Через claude.ai - без ключа, под своим аккаунтом"),
+                           ("api", "Через API-ключ - ответ прямо в виджете")):
+            a = mm.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(self.mode() == key)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: (self.set_opt("mode", k), self.render()))
+        om = menu.addMenu("Где открывать claude.ai")
+        grp2 = QActionGroup(om)
+        for key, label in (("panel", "В окошке рядом с виджетом"), ("app", "В приложении Claude"),
+                           ("browser", "В браузере")):
+            a = om.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(self.open_in() == key)
+            a.setEnabled(key != "panel" or web_engine() is not None)
+            grp2.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: (self.set_opt("open_in", k), self.render()))
+        menu.addAction("Новый чат").triggered.connect(self.new_chat if self.mode() == "api" else (lambda: self.ask_web("")))
         menu.addAction("API-ключ Claude...").triggered.connect(self.ask_key)
         if self.mgr.cfg.get("claude_key"):
             menu.addAction("Удалить сохранённый ключ").triggered.connect(
@@ -3574,7 +3723,7 @@ def demo_discord():
 
 class DiscordCard(Card):
     KIND = "discord"
-    TITLE = "Discord"
+    TITLE = "Discord: сервер"
     DEFAULT_SIZE = "m"
     _got = Signal(object, object, object)
     _ava = Signal(object, object)
@@ -3811,8 +3960,522 @@ class DiscordCard(Card):
         self.timer.stop()
 
 
+# ---------------------------------------------------------------------------
+#  Уведомления (Discord и других программ) - из журнала уведомлений Windows
+# ---------------------------------------------------------------------------
+NOTIFY_APPS = {"discord": "Discord", "telegram": "Telegram", "all": "Все программы"}
+
+
+def notify_app_name(aumid):
+    a = (aumid or "").lower()
+    for key, title in (("discord", "Discord"), ("telegram", "Telegram"), ("whatsapp", "WhatsApp"),
+                       ("chrome", "Chrome"), ("msedge", "Edge"), ("firefox", "Firefox"), ("outlook", "Outlook"),
+                       ("teams", "Teams"), ("steam", "Steam"), ("vk", "VK"), ("yandex", "Яндекс")):
+        if key in a:
+            return title
+    base = (aumid or "").split("!")[0].split("_")[0]          # Microsoft.WindowsStore_8wekyb3d8bbwe!App
+    tail = base.split(".")[-1] if base else ""
+    return tail[:24] or "Программа"
+
+
+def wpn_db_path():
+    p = os.environ.get("SNOWWIDGETS_WPNDB")
+    if p:
+        return p
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications", "wpndatabase.db")
+
+
+def parse_toast(payload):
+    """XML уведомления -> (заголовок, текст, путь к картинке)."""
+    import xml.etree.ElementTree as ET
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    try:
+        root = ET.fromstring(payload)
+    except Exception:
+        return None
+    texts = [(t.text or "").strip() for t in root.iter("text") if (t.text or "").strip()]
+    img = None
+    for im in root.iter("image"):
+        src = im.get("src") or ""
+        if src.startswith("file:///"):
+            src = urllib.parse.unquote(src[8:])
+            if not (len(src) > 1 and src[1] == ":"):         # не "C:/..." - путь Linux/macOS
+                src = "/" + src
+        elif src.startswith("file://"):
+            src = urllib.parse.unquote(src[7:])
+        if src and os.path.isfile(src):
+            img = src
+            if im.get("placement") == "appLogoOverride":
+                break
+    if not texts:
+        return None
+    return texts[0], "\n".join(texts[1:]), img
+
+
+class NotifyService(QObject):
+    """Раз в 2 секунды смотрит журнал уведомлений Windows (тот же, что показывает Центр уведомлений).
+    Уведомления, которые уже закрыли в Windows, остаются в виджете - он хранит свою историю."""
+    updated = Signal()
+    _got = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.items = []            # [{id, app, aumid, title, body, img, time}] новые сверху
+        self.error = None
+        self.seen = set()
+        self.read_until = 0.0
+        self._sig = None
+        self.hist_file = os.path.join(DATA_DIR, "notifications.json")
+        try:
+            with open(self.hist_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.items = data.get("items", [])[:200]
+            self.read_until = float(data.get("read_until", 0))
+            self.seen = {it["id"] for it in self.items}
+        except Exception:
+            pass
+        self._got.connect(self._on)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start(2000)
+        self._busy = False
+        QTimer.singleShot(200, self.poll)
+
+    def poll(self):
+        if self._busy:
+            return
+        self._busy = True
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        try:
+            res = self._read()
+        except Exception as ex:
+            res = {"error": "Не удалось прочитать уведомления Windows (%s)" % type(ex).__name__}
+        try:
+            self._got.emit(res)
+        except RuntimeError:
+            pass
+
+    def _read(self):
+        if DEMO and not os.environ.get("SNOWWIDGETS_WPNDB"):
+            return {"rows": []}
+        db = wpn_db_path()
+        if not os.path.isfile(db):
+            return {"error": "Журнал уведомлений Windows не найден" if IS_WIN else "Работает только в Windows"}
+        sig = []
+        for ext in ("", "-wal"):
+            try:
+                st = os.stat(db + ext)
+                sig.append((st.st_mtime, st.st_size))
+            except OSError:
+                sig.append(None)
+        if sig == self._sig:
+            return None                                     # ничего не поменялось
+        self._sig = sig
+        import sqlite3
+        tmp = os.path.join(DATA_DIR, "wpn_copy")
+        os.makedirs(tmp, exist_ok=True)
+        dst = os.path.join(tmp, "wpn.db")
+        for ext in ("", "-wal", "-shm"):                   # копия, чтобы не мешать Windows
+            try:
+                if os.path.exists(db + ext):
+                    shutil.copyfile(db + ext, dst + ext)
+                elif os.path.exists(dst + ext):
+                    os.remove(dst + ext)
+            except OSError:
+                pass
+        con = sqlite3.connect(dst, timeout=2)
+        try:
+            rows = con.execute(
+                "SELECT n.Id, n.ArrivalTime, n.Payload, h.PrimaryId FROM Notification n "
+                "LEFT JOIN NotificationHandler h ON n.HandlerId = h.RecordId "
+                "WHERE n.Type = 'toast' ORDER BY n.ArrivalTime DESC LIMIT 150").fetchall()
+        finally:
+            con.close()
+        out = []
+        for nid, arrival, payload, aumid in rows:
+            t = parse_toast(payload)
+            if t is None:
+                continue
+            try:
+                ts = (int(arrival) / 1e7) - 11644473600     # FILETIME -> unix
+            except Exception:
+                ts = time.time()
+            out.append({"id": "%s:%s" % (aumid, nid), "aumid": aumid or "", "app": notify_app_name(aumid),
+                        "title": t[0], "body": t[1], "img": t[2], "time": ts})
+        return {"rows": out}
+
+    def _on(self, res):
+        self._busy = False
+        if res is None:
+            return
+        if "error" in res:
+            self.error = res["error"]
+            self.updated.emit()
+            return
+        self.error = None
+        fresh = [r for r in res["rows"] if r["id"] not in self.seen]
+        if not fresh:
+            if self.error is not None:
+                self.updated.emit()
+            return
+        for r in fresh:
+            self.seen.add(r["id"])
+        self.items = sorted(fresh + self.items, key=lambda r: -r["time"])[:200]
+        self.save()
+        self.updated.emit()
+
+    def add_demo(self, app, title, body):
+        r = {"id": "demo:%f" % time.time(), "aumid": app, "app": notify_app_name(app), "title": title,
+             "body": body, "img": None, "time": time.time()}
+        self._on({"rows": [r]})
+
+    def save(self):
+        try:
+            with open(self.hist_file, "w", encoding="utf-8") as fh:
+                json.dump({"items": self.items[:200], "read_until": self.read_until}, fh, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def filtered(self, which):
+        if which == "all":
+            return list(self.items)
+        return [it for it in self.items if which in (it.get("aumid") or "").lower()]
+
+    def mark_read(self):
+        self.read_until = time.time()
+        self.save()
+        self.updated.emit()
+
+    def clear(self, which):
+        keep = [it for it in self.items if it not in self.filtered(which)]
+        self.items = keep
+        self.save()
+        self.updated.emit()
+
+
+def time_ago(ts):
+    d = time.time() - ts
+    if d < 60:
+        return "сейчас"
+    if d < 3600:
+        return "%d мин" % (d // 60)
+    t = datetime.datetime.fromtimestamp(ts)
+    if t.date() == datetime.date.today():
+        return t.strftime("%H:%M")
+    if (datetime.date.today() - t.date()).days == 1:
+        return "вчера"
+    return "%d %s" % (t.day, MONTHS_GEN[t.month - 1][:3])
+
+
+class NotifyCard(Card):
+    KIND = "notify"
+    TITLE = "Уведомления Discord"
+    DEFAULT_SIZE = "l"
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        cfg.setdefault("apps", "discord")
+        self.svc = mgr.notify()
+        self.svc.updated.connect(self._changed)
+        self.imgs = {}
+        self.flash_t0 = 0.0
+        self._count = len(self.items())
+
+    def items(self):
+        return self.svc.filtered(self.cfg.get("apps", "discord"))
+
+    def _changed(self):
+        n = len(self.items())
+        if n > self._count and self.animated:
+            self.flash_t0 = time.time()                    # новое уведомление - вспышка рамки
+        self._count = n
+        self.update()
+
+    def unread(self):
+        return [it for it in self.items() if it["time"] > self.svc.read_until]
+
+    def _img(self, path):
+        if not path:
+            return None
+        if path not in self.imgs:
+            img = QImage(path)
+            self.imgs[path] = None if img.isNull() else img.scaled(
+                64, 64, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        return self.imgs[path]
+
+    def _avatar(self, p, it, cx, cy, rad):
+        img = self._img(it.get("img"))
+        p.save()
+        path = QPainterPath()
+        path.addEllipse(QPointF(cx, cy), rad, rad)
+        p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        if img is not None:
+            p.drawImage(QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), img)
+        else:
+            col = DISCORD_BLURPLE if "discord" in it.get("aumid", "").lower() else \
+                QColor.fromHsv((sum(map(ord, it["title"])) * 37) % 360, 120, 200)
+            p.fillPath(path, col)
+            text(p, QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), it["title"][:1].upper(), font(rad * 0.9, SEMI), WHITE)
+        p.restore()
+
+    def _title(self):
+        return {"discord": "Discord", "telegram": "Telegram"}.get(self.cfg.get("apps"), "Уведомления")
+
+    def paint(self, p, r, th):
+        items = self.items()
+        unread = self.unread()
+        icon_col = WHITE if th["mode"] == "color" else DISCORD_BLURPLE
+        e = (time.time() - self.flash_t0) / 1.4 if self.flash_t0 else 1.0
+        if e < 1.0:                                        # вспышка при новом уведомлении
+            self.want_frame(16)
+            c = QColor(DISCORD_BLURPLE)
+            c.setAlpha(int(150 * (1 - e) * (0.6 + 0.4 * math.sin(e * 18))))
+            p.save()
+            p.setPen(QPen(c, 6))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r.adjusted(3, 3, -3, -3), RADIUS - 2, RADIUS - 2)
+            p.restore()
+        size = self.cfg["size"]
+        if size == "s":
+            draw_bubble(p, r.x() + 28, r.y() + 26, 22, icon_col, dots=False)
+            text(p, QRectF(r.x() + 46, r.y() + 14, r.width() - 56, 24), self._title(), font(13, SEMI), th["fg"], AL | AVC)
+            n = self.av("unread", float(len(unread)), 5.0, start=0.0)
+            text(p, QRectF(r.x() + 16, r.y() + 42, r.width() - 32, 50), str(int(round(n))), font(42, LIGHT),
+                 th["fg"], AL | AVC)
+            text(p, QRectF(r.x() + 18, r.y() + 92, r.width() - 32, 18),
+                 plural(len(unread), "новое", "новых", "новых"), font(12), th["fg2"], AL | AVC)
+            if items:
+                text(p, QRectF(r.x() + 16, r.bottom() - 34, r.width() - 32, 18), items[0]["title"], font(11, SEMI),
+                     th["fg"], AL | AVC)
+            return
+        draw_bubble(p, r.x() + 30, r.y() + 25, 24, icon_col, dots=False)
+        text(p, QRectF(r.x() + 50, r.y() + 12, r.width() - 150, 24), self._title(), font(15, SEMI), th["fg"], AL | AVC)
+        if unread:
+            label = str(len(unread)) if len(unread) < 100 else "99+"
+            p.setFont(font(15, SEMI))
+            tw = p.fontMetrics().horizontalAdvance(self._title())
+            p.setFont(font(11, SEMI))
+            bw = max(22, p.fontMetrics().horizontalAdvance(label) + 14)
+            pill = QRectF(r.x() + 50 + tw + 8, r.y() + 14, bw, 20)
+            p.setPen(NOPEN)
+            p.setBrush(RED)
+            p.drawRoundedRect(pill, 10, 10)
+            text(p, pill, label, font(11, SEMI), WHITE)
+        if items:
+            cb = QRectF(r.right() - 104, r.y() + 13, 88, 22)
+            p.setPen(NOPEN)
+            p.setBrush(th["btn"])
+            p.drawRoundedRect(cb, 11, 11)
+            text(p, cb, "Прочитано" if unread else "Очистить", font(11, SEMI), th["fg"])
+            self.hit(cb, self.svc.mark_read if unread else (lambda: self.svc.clear(self.cfg.get("apps", "discord"))))
+        if not items:
+            msg = self.svc.error or ("Пока нет уведомлений.\nВ Discord: Настройки → Уведомления → «Включить "
+                                     "уведомления на рабочем столе». Пока окно Discord открыто, он их не присылает.")
+            p.setFont(font(12))
+            p.setPen(th["fg2"])
+            p.drawText(QRectF(r.x() + 18, r.y() + 52, r.width() - 36, r.height() - 64),
+                       int(AL | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
+            return
+        y = r.y() + 48
+        row = 56 if size != "m" else 50
+        for i, it in enumerate(items):
+            if y + row > r.bottom() - 6:
+                break
+            k = self.av("in:" + it["id"], 1.0, 9.0, start=0.0)       # новое уведомление выезжает сверху
+            p.save()
+            p.setOpacity(p.opacity() * k)
+            p.translate((1 - k) * 30, 0)
+            new = it["time"] > self.svc.read_until
+            rc = QRectF(r.x() + 10, y, r.width() - 20, row - 4)
+            if new:
+                p.setPen(NOPEN)
+                p.setBrush(th["btn"])
+                p.drawRoundedRect(rc, 12, 12)
+            self._avatar(p, it, rc.x() + 24, rc.center().y(), 16)
+            tx = rc.x() + 48
+            text(p, QRectF(tx, rc.y() + 5, rc.width() - 48 - 54, 18), it["title"], font(13, SEMI), th["fg"], AL | AVC)
+            text(p, QRectF(rc.right() - 56, rc.y() + 5, 48, 18), time_ago(it["time"]), font(11), th["fg2"], AR | AVC)
+            body = " ".join((it.get("body") or "").split())
+            if self.cfg.get("apps") == "all":
+                body = it["app"] + " · " + body
+            text(p, QRectF(tx, rc.y() + 24, rc.width() - 48 - 10, 18), body, font(12), th["fg2"], AL | AVC)
+            if new:
+                p.setPen(NOPEN)
+                p.setBrush(DISCORD_BLURPLE)
+                p.drawEllipse(QPointF(rc.x() + 6, rc.center().y()), 3, 3)
+            p.restore()
+            self.hit(rc, lambda a=it.get("aumid", ""): self.open_app(a))
+            y += row
+        self.want_frame(30 * 1000)                          # обновлять "5 мин назад"
+
+    def open_app(self, aumid=""):
+        self.svc.mark_read()
+        a = aumid.lower()
+        if "telegram" in a:
+            open_target("tg://", "https://web.telegram.org/")
+        elif "discord" in a or self.cfg.get("apps") == "discord":
+            open_target("discord://", "https://discord.com/app")
+
+    def activate(self):
+        self.open_app(self.cfg.get("apps", "discord"))
+
+    def extra_menu(self, menu):
+        sm = menu.addMenu("Чьи уведомления показывать")
+        grp = QActionGroup(sm)
+        for key, label in NOTIFY_APPS.items():
+            a = sm.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(self.cfg.get("apps") == key)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: (self.set_opt("apps", k), setattr(self, "_count",
+                                                                                         len(self.items()))))
+        menu.addAction("Отметить всё прочитанным").triggered.connect(self.svc.mark_read)
+        menu.addAction("Очистить список").triggered.connect(lambda: self.svc.clear(self.cfg.get("apps", "discord")))
+        menu.addAction("Открыть Discord").triggered.connect(lambda: open_target("discord://", "https://discord.com/app"))
+        menu.addAction("Настройки уведомлений Windows").triggered.connect(
+            lambda: open_target("ms-settings:notifications"))
+
+
+# ---------------------------------------------------------------------------
+#  Claude без API-ключа: claude.ai во встроенном окошке (вход под своим аккаунтом)
+# ---------------------------------------------------------------------------
+CLAUDE_WEB_HOSTS = ("claude.ai", "claude.com", "anthropic.com", "accounts.google.com", "google.com",
+                    "gstatic.com", "googleusercontent.com", "apple.com", "cloudflare.com", "challenges.cloudflare.com")
+
+
+def claude_url(q=""):
+    return "https://claude.ai/new" + (("?q=" + urllib.parse.quote(q)) if q else "")
+
+
+_WEB = {}
+
+
+def web_engine():
+    """Встроенный браузер Qt (QtWebEngine) или None."""
+    if "mod" not in _WEB:
+        try:
+            from PySide6 import QtWebEngineCore, QtWebEngineWidgets
+            _WEB["mod"] = (QtWebEngineCore, QtWebEngineWidgets)
+        except Exception:
+            _WEB["mod"] = None
+    return _WEB["mod"]
+
+
+class ClaudePanel(QWidget):
+    """Окошко с claude.ai рядом с виджетом. Профиль браузера свой и сохраняется - входить нужно один раз."""
+
+    def __init__(self, mgr):
+        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        core, widgets = web_engine()
+        self.mgr = mgr
+        self.setWindowTitle("Claude")
+        self.resize(460, 680)
+        self.setStyleSheet("QWidget#bar { background: #262624; } QLabel { color: #F5F4EF; font-size: 13px; "
+                           "font-weight: 600; } QPushButton { color: #F5F4EF; background: transparent; border: none;"
+                           " font-size: 15px; padding: 4px 9px; border-radius: 6px; }"
+                           " QPushButton:hover { background: rgba(255,255,255,0.12); }")
+        from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QHBoxLayout
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        bar = QWidget(self)
+        bar.setObjectName("bar")
+        bar.setFixedHeight(36)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(12, 0, 6, 0)
+        bl.addWidget(QLabel("Claude"))
+        bl.addStretch(1)
+        self.b_new = QPushButton("+")
+        self.b_new.setToolTip("Новый чат")
+        self.b_ext = QPushButton("↗")
+        self.b_ext.setToolTip("Открыть в браузере")
+        self.b_pin = QPushButton("📌")
+        self.b_pin.setToolTip("Не скрывать, когда щёлкаешь в другом месте")
+        self.b_pin.setCheckable(True)
+        self.b_close = QPushButton("✕")
+        self.b_close.setToolTip("Скрыть (Esc)")
+        for b in (self.b_new, self.b_ext, self.b_pin, self.b_close):
+            bl.addWidget(b)
+        lay.addWidget(bar)
+        self.bar = bar
+        self.profile = core.QWebEngineProfile("snowwidgets-claude", self)
+        store = os.path.join(DATA_DIR, "web")
+        self.profile.setPersistentStoragePath(store)
+        self.profile.setCachePath(os.path.join(store, "cache"))
+        self.profile.setPersistentCookiesPolicy(core.QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        import re
+        ua = re.sub(r"\s*QtWebEngine/\S+", "", self.profile.httpUserAgent())   # обычный Chrome, а не "QtWebEngine"
+        self.profile.setHttpUserAgent(ua)
+        panel = self
+
+        class Page(core.QWebEnginePage):
+            def acceptNavigationRequest(self, url, nav_type, is_main):
+                host = url.host().lower()
+                if url.scheme() in ("http", "https") and host and not any(
+                        host == h or host.endswith("." + h) for h in CLAUDE_WEB_HOSTS):
+                    QDesktopServices.openUrl(url)          # посторонние ссылки - в обычный браузер
+                    return False
+                return super().acceptNavigationRequest(url, nav_type, is_main)
+
+            def createWindow(self, _type):
+                tmp = core.QWebEnginePage(panel.profile, panel)
+                tmp.urlChanged.connect(lambda u, t=tmp: (QDesktopServices.openUrl(u), t.deleteLater()))
+                return tmp
+
+        self.view = widgets.QWebEngineView(self)
+        self.page = Page(self.profile, self.view)
+        self.view.setPage(self.page)
+        self.view.setZoomFactor(0.9)
+        lay.addWidget(self.view, 1)
+        self.b_new.clicked.connect(lambda: self.open(claude_url()))
+        self.b_ext.clicked.connect(lambda: QDesktopServices.openUrl(self.view.url()))
+        self.b_close.clicked.connect(self.hide)
+        self._drag = None
+
+    def open(self, url, near=None):
+        self.view.setUrl(QUrl(url))
+        if near is not None and not self.isVisible():
+            scr = QApplication.screenAt(near.center()) or QApplication.primaryScreen()
+            a = scr.availableGeometry()
+            x = near.left() - self.width() - 8 if near.left() - self.width() - 8 >= a.left() else near.right() + 8
+            x = max(a.left(), min(x, a.right() - self.width()))
+            y = max(a.top(), min(near.top(), a.bottom() - self.height()))
+            self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.view.setFocus()
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            self.hide()
+        else:
+            super().keyPressEvent(ev)
+
+    def changeEvent(self, ev):
+        super().changeEvent(ev)
+        if ev.type() == ev.Type.ActivationChange and not self.isActiveWindow() and not self.b_pin.isChecked():
+            QTimer.singleShot(150, lambda: (not self.isActiveWindow() and QApplication.activePopupWidget() is None
+                                            and QApplication.activeModalWidget() is None and self.hide()))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and ev.position().y() <= self.bar.height():
+            self._drag = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, ev):
+        if self._drag is not None:
+            self.move(ev.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, ev):
+        self._drag = None
+
+
 KINDS = {c.KIND: c for c in (WeatherCard, MusicCard, BatteryCard, PhotoCard, CalendarCard, ClockCard,
-                                SystemCard, ClaudeCard, DiscordCard)}
+                                SystemCard, ClaudeCard, NotifyCard, DiscordCard)}
 
 
 # ---------------------------------------------------------------------------
@@ -3946,6 +4609,23 @@ class Manager(QObject):
         except Exception:
             pass
         return {"style": "dark", "opacity": 1.0, "locked": False, "animations": True, "widgets": []}
+
+    def notify(self):
+        if getattr(self, "_notify", None) is None:
+            self._notify = NotifyService()
+        return self._notify
+
+    def claude_panel(self):
+        """Окошко claude.ai (одно на все виджеты Claude) или None, если встроенного браузера нет."""
+        if getattr(self, "_claude_panel", None) is None:
+            if web_engine() is None:
+                return None
+            try:
+                self._claude_panel = ClaudePanel(self)
+            except Exception:
+                traceback.print_exc()
+                self._claude_panel = False
+        return self._claude_panel or None
 
     def media(self):
         """Общий опрос плеера (создаётся, когда появляется первый виджет музыки)."""
@@ -4185,6 +4865,10 @@ class Manager(QObject):
     def quit(self):
         self._save_timer.stop()
         self._write()
+        pan = getattr(self, "_claude_panel", None)
+        if pan:                                   # страница браузера должна закрыться раньше своего профиля
+            pan.view.setPage(None)
+            pan.page.deleteLater()
         if self.tray is not None:
             self.tray.hide()
         self.app.quit()
@@ -4194,6 +4878,7 @@ def main():
     if not single_instance():
         msgbox("Виджеты уже запущены - ищи значок в трее (возле часов).")
         return 0
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)   # для встроенного браузера
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)

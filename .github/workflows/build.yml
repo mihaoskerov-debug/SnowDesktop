@@ -27,7 +27,7 @@ jobs:
       - name: Build exe
         run: python -m PyInstaller --noconsole --onefile --name SnowDesktop --icon snow.ico snow.pyw
       - name: Build widgets exe
-        run: python -m PyInstaller --noconsole --onefile --name SnowWidgets --hidden-import hid --collect-submodules winrt --collect-submodules anthropic --icon snow.ico widgets.pyw
+        run: python -m PyInstaller --noconsole --onefile --name SnowWidgets --hidden-import hid --collect-submodules winrt --collect-submodules anthropic --hidden-import PySide6.QtWebEngineWidgets --hidden-import PySide6.QtWebEngineCore --icon snow.ico widgets.pyw
       - name: Rename
         run: |
           Copy-Item dist\SnowDesktop.exe SnowDesktop-windows.exe

@@ -4,7 +4,7 @@ rem Result: dist\SnowWidgets.exe
 cd /d "%~dp0"
 python -m pip install --upgrade pip pyinstaller PySide6 hidapi anthropic winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Media.Control winrt-Windows.Storage.Streams
 if errorlevel 1 goto fail
-python -m PyInstaller --noconsole --onefile --name SnowWidgets --hidden-import hid --collect-submodules winrt --collect-submodules anthropic widgets.pyw
+python -m PyInstaller --noconsole --onefile --name SnowWidgets --hidden-import hid --collect-submodules winrt --collect-submodules anthropic --hidden-import PySide6.QtWebEngineWidgets --hidden-import PySide6.QtWebEngineCore widgets.pyw
 if errorlevel 1 goto fail
 echo.
 echo Done: dist\SnowWidgets.exe

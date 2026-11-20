@@ -14,6 +14,7 @@
 Виджет: перетаскивай левой кнопкой, правая кнопка - размер и настройки, двойной клик - действие.
 Данные: %APPDATA%\\SnowWidgets\\widgets.json
 """
+import base64
 import calendar
 import ctypes
 import datetime
@@ -28,12 +29,13 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -94,9 +96,9 @@ from PySide6.QtCore import (QObject, QPointF, QRectF, QStandardPaths, Qt,  # noq
                             QTimer, QUrl, Signal)
 from PySide6.QtGui import (QActionGroup, QColor, QDesktopServices, QFont,  # noqa: E402
                            QIcon, QImage, QImageReader, QLinearGradient, QPainter,
-                           QPainterPath, QPen, QPixmap, QRadialGradient)
-from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMenu,  # noqa: E402
-                               QSystemTrayIcon, QWidget)
+                           QPainterPath, QPalette, QPen, QPixmap, QRadialGradient)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QInputDialog, QLineEdit,  # noqa: E402
+                               QMenu, QSystemTrayIcon, QTextBrowser, QWidget)
 
 RH = (QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
       | QPainter.RenderHint.TextAntialiasing)
@@ -163,7 +165,9 @@ STYLES = {
 }
 KIND_COLORS = {"battery": ("#2BC48A", "#0B8C8F"), "calendar": ("#FF6A5C", "#F29A3E"),
                "clock": ("#5B5BD6", "#A35BE0"), "system": ("#2D7FF9", "#2EC0EE"),
-               "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9")}
+               "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9"),
+               "music": ("#F2B705", "#E06A1B"), "claude": ("#D97757", "#A8553A"),
+               "discord": ("#5865F2", "#4248C9")}
 OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
 
 
@@ -2667,7 +2671,1148 @@ class SystemCard(Card):
             subprocess.Popen(["taskmgr"], creationflags=NO_WINDOW)
 
 
-KINDS = {c.KIND: c for c in (WeatherCard, BatteryCard, PhotoCard, CalendarCard, ClockCard, SystemCard)}
+# ---------------------------------------------------------------------------
+#  Общие мелочи для новых виджетов: открыть программу, хранить ключ, кнопки плеера
+# ---------------------------------------------------------------------------
+def open_target(*targets):
+    """Открыть первую сработавшую цель: протокол программы (discord://, yandexmusic://) или ссылку."""
+    for t in targets:
+        try:
+            if IS_WIN and "://" in t and not t.startswith("http"):
+                os.startfile(t)                     # noqa - есть только в Windows
+                return True
+            if os.path.isfile(t):
+                subprocess.Popen([t], creationflags=NO_WINDOW if IS_WIN else 0)
+                return True
+            if t.startswith("http"):
+                QDesktopServices.openUrl(QUrl(t))
+                return True
+        except Exception:
+            continue
+    return False
+
+
+if IS_WIN:
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def secret_protect(text):
+    """Шифруем ключ средствами Windows (DPAPI): расшифровать сможет только этот пользователь на этом ПК."""
+    raw = text.encode("utf-8")
+    if IS_WIN:
+        try:
+            buf = ctypes.create_string_buffer(raw, len(raw))
+            inp = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+            out = DATA_BLOB()
+            if ctypes.windll.crypt32.CryptProtectData(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+                data = ctypes.string_at(out.pbData, out.cbData)
+                ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+                return "dpapi:" + base64.b64encode(data).decode()
+        except Exception:
+            pass
+    return "b64:" + base64.b64encode(raw).decode()
+
+
+def secret_reveal(s):
+    if not s:
+        return ""
+    try:
+        kind, data = s.split(":", 1)
+        raw = base64.b64decode(data)
+        if kind == "b64":
+            return raw.decode("utf-8")
+        if kind == "dpapi" and IS_WIN:
+            buf = ctypes.create_string_buffer(raw, len(raw))
+            inp = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+            out = DATA_BLOB()
+            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(inp), None, None, None, None, 0,
+                                                        ctypes.byref(out)):
+                res = ctypes.string_at(out.pbData, out.cbData)
+                ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+                return res.decode("utf-8")
+    except Exception:
+        pass
+    return ""
+
+
+def pip_install(*pkgs):
+    """Доставить библиотеку, если программа запущена из .pyw (в .exe всё уже внутри)."""
+    if FROZEN:
+        return False
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check"] + list(pkgs),
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=NO_WINDOW if IS_WIN else 0, timeout=600)
+        importlib.invalidate_caches()
+        return True
+    except Exception:
+        return False
+
+
+def draw_media_icon(p, kind, cx, cy, s, color):
+    """Кнопки плеера: play, pause, prev, next."""
+    p.save()
+    p.setPen(NOPEN)
+    p.setBrush(color)
+    if kind == "pause":
+        w = s * 0.22
+        p.drawRoundedRect(QRectF(cx - s * 0.3, cy - s * 0.4, w, s * 0.8), w * 0.3, w * 0.3)
+        p.drawRoundedRect(QRectF(cx + s * 0.08, cy - s * 0.4, w, s * 0.8), w * 0.3, w * 0.3)
+    elif kind == "play":
+        path = QPainterPath()
+        path.moveTo(cx - s * 0.28, cy - s * 0.42)
+        path.lineTo(cx + s * 0.42, cy)
+        path.lineTo(cx - s * 0.28, cy + s * 0.42)
+        path.closeSubpath()
+        p.drawPath(path)
+    else:
+        d = 1 if kind == "next" else -1
+        for k in (0, 1):
+            path = QPainterPath()
+            x0 = cx + d * (-s * 0.36 + k * s * 0.34)
+            path.moveTo(x0, cy - s * 0.3)
+            path.lineTo(x0 + d * s * 0.34, cy)
+            path.lineTo(x0, cy + s * 0.3)
+            path.closeSubpath()
+            p.drawPath(path)
+        p.drawRect(QRectF(cx + d * s * 0.32 - s * 0.04, cy - s * 0.3, s * 0.08, s * 0.6))
+    p.restore()
+
+
+def draw_note(p, cx, cy, s, color):
+    p.save()
+    p.setPen(NOPEN)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(cx - s * 0.18, cy + s * 0.26), s * 0.16, s * 0.12)
+    p.drawEllipse(QPointF(cx + s * 0.26, cy + s * 0.16), s * 0.16, s * 0.12)
+    p.drawRect(QRectF(cx - s * 0.06, cy - s * 0.36, s * 0.07, s * 0.62))
+    p.drawRect(QRectF(cx + s * 0.38, cy - s * 0.46, s * 0.07, s * 0.62))
+    path = QPainterPath()
+    path.moveTo(cx - s * 0.06, cy - s * 0.36)
+    path.lineTo(cx + s * 0.45, cy - s * 0.46)
+    path.lineTo(cx + s * 0.45, cy - s * 0.3)
+    path.lineTo(cx - s * 0.06, cy - s * 0.2)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.restore()
+
+
+def draw_bubble(p, cx, cy, s, color, dots=True):
+    """Облачко чата."""
+    p.save()
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(cx - s * 0.48, cy - s * 0.38, s * 0.96, s * 0.66), s * 0.2, s * 0.2)
+    tail = QPainterPath()
+    tail.moveTo(cx - s * 0.22, cy + s * 0.22)
+    tail.lineTo(cx - s * 0.3, cy + s * 0.46)
+    tail.lineTo(cx, cy + s * 0.24)
+    tail.closeSubpath()
+    p.setPen(NOPEN)
+    p.setBrush(color)
+    p.drawPath(path.united(tail))
+    if dots:
+        p.setBrush(QColor(0, 0, 0, 110))
+        for k in (-1, 0, 1):
+            p.drawEllipse(QPointF(cx + k * s * 0.22, cy - s * 0.05), s * 0.065, s * 0.065)
+    p.restore()
+
+
+def fmt_time(sec):
+    sec = max(0, int(sec))
+    return "%d:%02d" % (sec // 60, sec % 60) if sec < 3600 else "%d:%02d:%02d" % (sec // 3600, sec // 60 % 60, sec % 60)
+
+
+def blur_image(img, w, h, strength=12):
+    if img is None or img.isNull():
+        return None
+    k = max(w / img.width(), h / img.height())
+    sm = Qt.TransformationMode.SmoothTransformation
+    ign = Qt.AspectRatioMode.IgnoreAspectRatio
+    cov = img.scaled(max(1, int(img.width() * k)), max(1, int(img.height() * k)), ign, sm)
+    cov = cov.copy((cov.width() - w) // 2, (cov.height() - h) // 2, w, h)
+    small = cov.scaled(max(2, w // strength), max(2, h // strength), ign, sm)
+    return small.scaled(w, h, ign, sm)
+
+
+# ---------------------------------------------------------------------------
+#  Музыка: что играет в Яндекс Музыке (и любом другом плеере) - через Windows
+# ---------------------------------------------------------------------------
+_WINRT_PKGS = ("winrt-runtime", "winrt-Windows.Foundation", "winrt-Windows.Foundation.Collections",
+               "winrt-Windows.Media.Control", "winrt-Windows.Storage.Streams")
+
+
+def _winrt_try():
+    for base in ("winrt", "winsdk"):
+        try:
+            mc = importlib.import_module(base + ".windows.media.control")
+            ss = importlib.import_module(base + ".windows.storage.streams")
+            return mc, ss
+        except Exception:
+            continue
+    return None
+
+
+def _secs(v):
+    if v is None:
+        return 0.0
+    if hasattr(v, "total_seconds"):
+        return v.total_seconds()
+    try:
+        return float(v) / 1e7                   # TimeSpan в единицах по 100 нс
+    except Exception:
+        return 0.0
+
+
+def media_key(name):
+    """Запасной вариант управления: мультимедийные клавиши (работают с любым плеером)."""
+    vk = {"toggle": 0xB3, "next": 0xB0, "prev": 0xB1}.get(name)
+    if IS_WIN and vk:
+        try:
+            _user32.keybd_event(vk, 0, 0, 0)
+            _user32.keybd_event(vk, 0, 2, 0)
+        except Exception:
+            pass
+
+
+def app_title(aumid):
+    a = (aumid or "").lower()
+    for key, title in (("yandex", "Яндекс Музыка"), ("spotify", "Spotify"), ("chrome", "Браузер Chrome"),
+                       ("msedge", "Браузер Edge"), ("firefox", "Браузер Firefox"), ("opera", "Браузер Opera"),
+                       ("browser", "Яндекс Браузер"), ("vk", "VK Музыка"), ("zune", "Музыка Windows"),
+                       ("media", "Медиаплеер")):
+        if key in a:
+            return title
+    return "Плеер"
+
+
+class MediaService(QObject):
+    """Опрашивает "Системные элементы управления мультимедиа" Windows (то самое окошко, что
+    всплывает при регулировке громкости). Туда пишут Яндекс Музыка, браузеры, Spotify и другие."""
+    updated = Signal()
+    _got = Signal(object)
+
+    def __init__(self, mgr):
+        super().__init__()
+        self.mgr = mgr
+        self.state = None
+        self.error = None
+        self.loop = None
+        self.session = None
+        self._got.connect(self._on)
+        self._demo_play = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    # ----- поток опроса -----
+    def _emit(self, payload):
+        try:
+            self._got.emit(payload)
+        except RuntimeError:
+            pass
+
+    def _run(self):
+        if DEMO:
+            img = None
+            for path in list_images(os.path.join(os.path.expanduser("~"), "Downloads", "Telegram Desktop"), False)[:1]:
+                img = QImage(path)
+            t0 = time.time()
+            while True:
+                self._emit({"state": {"title": "Снег идёт", "artist": "Тестовый исполнитель", "album": "",
+                                      "app": "Yandex.Music", "playing": self._demo_play,
+                                      "pos": 74.0 + ((time.time() - t0) if self._demo_play else 0), "dur": 213.0,
+                                      "stamp": time.time(), "cover": img, "key": ("Снег идёт", "")}})
+                time.sleep(1.0)
+        if not IS_WIN:
+            self._emit({"error": "Работает только в Windows"})
+            return
+        mods = _winrt_try()
+        if mods is None:
+            self._emit({"error": "Ставлю компонент для связи с плеером..."})
+            if pip_install(*_WINRT_PKGS):
+                mods = _winrt_try()
+        if mods is None:
+            self._emit({"error": "Нет компонента winrt. Выполни: pip install " + " ".join(_WINRT_PKGS)})
+            return
+        import asyncio
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._poll(mods))
+        except Exception:
+            self._emit({"error": "Не удалось подключиться к плееру Windows"})
+
+    async def _thumb(self, props, ss):
+        try:
+            ref = props.thumbnail
+            if ref is None:
+                return None
+            stream = await ref.open_read_async()
+            size = int(stream.size)
+            if not size:
+                return None
+            buf = ss.Buffer(size)
+            res = await stream.read_async(buf, size, ss.InputStreamOptions.READ_AHEAD)
+            try:
+                data = bytes(memoryview(res))
+            except Exception:
+                reader = ss.DataReader.from_buffer(res)
+                arr = bytearray(res.length)
+                reader.read_bytes(arr)
+                data = bytes(arr)
+            img = QImage.fromData(data)
+            return None if img.isNull() else img
+        except Exception:
+            return None
+
+    def _pick(self, mgr):
+        sessions = list(mgr.get_sessions() or [])
+        ya = [s for s in sessions if "yandex" in (s.source_app_user_model_id or "").lower()]
+        if ya:
+            playing = [s for s in ya if int(s.get_playback_info().playback_status) == 4]
+            return (playing or ya)[0]
+        if self.mgr.cfg.get("music_only_yandex"):
+            return None
+        return mgr.get_current_session() or (sessions[0] if sessions else None)
+
+    async def _poll(self, mods):
+        import asyncio
+        mc, ss = mods
+        mgr = await mc.GlobalSystemMediaTransportControlsSessionManager.request_async()
+        last_key, cover = None, None
+        while True:
+            st = None
+            try:
+                s = self._pick(mgr)
+                self.session = s
+                if s is not None:
+                    props = await s.try_get_media_properties_async()
+                    info = s.get_playback_info()
+                    tl = s.get_timeline_properties()
+                    key = (props.title, props.artist, s.source_app_user_model_id)
+                    if key != last_key:
+                        last_key = key
+                        cover = await self._thumb(props, ss)
+                    playing = int(info.playback_status) == 4
+                    pos = _secs(tl.position) - _secs(tl.start_time)
+                    try:
+                        lu = tl.last_updated_time
+                        if playing and lu is not None and lu.year > 2000:
+                            age = (datetime.datetime.now(datetime.timezone.utc) - lu).total_seconds()
+                            if 0 < age < 6 * 3600:
+                                pos += age
+                    except Exception:
+                        pass
+                    st = {"title": props.title or "", "artist": props.artist or props.album_artist or "",
+                          "album": props.album_title or "", "app": s.source_app_user_model_id or "",
+                          "playing": playing, "pos": pos, "dur": _secs(tl.end_time) - _secs(tl.start_time),
+                          "stamp": time.time(), "cover": cover, "key": key}
+            except Exception:
+                st = None
+            self._emit({"state": st})
+            await asyncio.sleep(1.0)
+
+    def _on(self, payload):
+        if "error" in payload:
+            self.error = payload["error"]
+        else:
+            self.error = None
+            self.state = payload["state"]
+        self.updated.emit()
+
+    # ----- команды -----
+    def position(self):
+        st = self.state
+        if not st:
+            return 0.0
+        pos = st["pos"] + ((time.time() - st["stamp"]) if st["playing"] else 0.0)
+        return clamp(pos, 0.0, st["dur"]) if st["dur"] > 0 else max(0.0, pos)
+
+    def command(self, name, arg=None):
+        if self.state and name == "toggle":          # сразу показываем результат, не ждём плеер
+            self.state = dict(self.state, playing=not self.state["playing"], pos=self.position(), stamp=time.time())
+            self.updated.emit()
+        if DEMO:
+            if name == "toggle":
+                self._demo_play = not self._demo_play
+            return
+        s = self.session
+        if self.loop is None or s is None:
+            if name != "seek":
+                media_key(name)
+            return
+
+        async def run():
+            try:
+                if name == "toggle":
+                    await s.try_toggle_play_pause_async()
+                elif name == "next":
+                    await s.try_skip_next_async()
+                elif name == "prev":
+                    await s.try_skip_previous_async()
+                elif name == "seek":
+                    await s.try_change_playback_position_async(int(arg * 1e7))
+            except Exception:
+                if name != "seek":
+                    media_key(name)
+
+        try:
+            import asyncio
+            asyncio.run_coroutine_threadsafe(run(), self.loop)
+        except Exception:
+            media_key(name)
+
+
+YA_YELLOW = QColor("#FFD83D")
+
+
+class MusicCard(Card):
+    KIND = "music"
+    TITLE = "Яндекс Музыка"
+    DEFAULT_SIZE = "m"
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        self.media = mgr.media()
+        self.media.updated.connect(self._changed)
+        self._seek_to = 0.0
+        self.cover_key = None
+        self.blur = None
+        self.prev_blur = None
+        self.fade_t0 = 0.0
+
+    def _changed(self):
+        st = self.media.state
+        key = (st or {}).get("key")
+        if key != self.cover_key:
+            self.cover_key = key
+            self.prev_blur = self.blur
+            self.blur = self._make_blur()
+            self.fade_t0 = time.time() if self.animated else 0.0
+        self.update()
+
+    def _make_blur(self):
+        st = self.media.state
+        img = (st or {}).get("cover")
+        r = self.card_rect()
+        return blur_image(img, int(r.width()), int(r.height()), 10) if img is not None else None
+
+    def size_changed(self):
+        self.blur = self._make_blur()
+        self.prev_blur = None
+
+    def paint_bg(self, p, path, r, th):
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        g.setColorAt(0, QColor(48, 44, 30))
+        g.setColorAt(1, QColor(16, 16, 18))
+        p.fillPath(path, g)
+        e = ease_out_cubic((time.time() - self.fade_t0) / 0.6) if self.fade_t0 else 1.0
+        if e < 1.0:
+            self.want_frame(16)
+            if self.prev_blur is not None:
+                p.drawImage(r.topLeft(), self.prev_blur)
+        if self.blur is not None:
+            p.save()
+            p.setOpacity(p.opacity() * e)
+            p.drawImage(r.topLeft(), self.blur)
+            p.restore()
+        p.fillPath(path, QColor(0, 0, 0, 115))
+
+    def _cover(self, p, rc, img, radius=12):
+        p.save()
+        p.setPen(NOPEN)
+        for i in range(6, 0, -2):
+            p.setBrush(QColor(0, 0, 0, 18))
+            p.drawRoundedRect(rc.adjusted(-i * 0.3, -i * 0.1, i * 0.3, i * 0.6), radius + i * 0.3, radius + i * 0.3)
+        path = QPainterPath()
+        path.addRoundedRect(rc, radius, radius)
+        p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        if img is not None and not img.isNull():
+            k = max(rc.width() / img.width(), rc.height() / img.height())
+            w, h = img.width() * k, img.height() * k
+            p.drawImage(QRectF(rc.center().x() - w / 2, rc.center().y() - h / 2, w, h), img)
+        else:
+            g = QLinearGradient(rc.topLeft(), rc.bottomRight())
+            g.setColorAt(0, QColor("#FFD83D"))
+            g.setColorAt(1, QColor("#FF8A3D"))
+            p.fillRect(rc, g)
+            draw_note(p, rc.center().x(), rc.center().y(), rc.width() * 0.45, QColor(30, 20, 0, 200))
+        p.restore()
+
+    def _eq(self, p, x, y, h, playing):
+        """Маленький "эквалайзер" - прыгающие полоски, пока играет музыка."""
+        t = time.time()
+        p.save()
+        p.setPen(NOPEN)
+        p.setBrush(YA_YELLOW)
+        for i in range(3):
+            k = (0.35 + 0.65 * abs(math.sin(t * (5.0 + i * 1.7) + i))) if playing and self.animated else 0.35
+            bh = h * k
+            p.drawRoundedRect(QRectF(x + i * 4.5, y + h - bh, 3, bh), 1.2, 1.2)
+        p.restore()
+        if playing and self.animated:
+            self.want_frame(60)
+
+    def _controls(self, p, cx, cy, size, gap):
+        playing = bool((self.media.state or {}).get("playing"))
+        for name, dx, sc in (("prev", -gap, 0.7), ("toggle", 0, 1.0), ("next", gap, 0.7)):
+            s = size * sc
+            rc = QRectF(cx + dx - s * 0.75, cy - s * 0.75, s * 1.5, s * 1.5)
+            if name == "toggle":
+                p.setPen(NOPEN)
+                p.setBrush(QColor(255, 255, 255, 235))
+                p.drawEllipse(rc.center(), s * 0.72, s * 0.72)
+                draw_media_icon(p, "pause" if playing else "play", rc.center().x() + (0 if playing else s * 0.05),
+                                rc.center().y(), s * 0.62, QColor(20, 20, 22))
+            else:
+                draw_media_icon(p, name, rc.center().x(), rc.center().y(), s * 0.62, WHITE)
+            self.hit(rc, lambda n=name: self.media.command(n))
+
+    def _progress(self, p, rc, st):
+        dur = st["dur"]
+        pos = self.media.position()
+        draw_bar(p, QRectF(rc.x(), rc.y(), rc.width(), 4), pos / dur if dur > 0 else 0.0, WHITE,
+                 QColor(255, 255, 255, 60))
+        if dur > 0:
+            text(p, QRectF(rc.x(), rc.y() + 7, 60, 14), fmt_time(pos), font(10), QColor(255, 255, 255, 170), AL)
+            text(p, QRectF(rc.right() - 60, rc.y() + 7, 60, 14), "-" + fmt_time(dur - pos), font(10),
+                 QColor(255, 255, 255, 170), AR)
+            self.hit(QRectF(rc.x(), rc.y() - 6, rc.width(), 16),
+                     lambda: self.media.command("seek", self._seek_to))
+        if st["playing"]:
+            self.want_frame(500)
+
+    def mousePressEvent(self, ev):
+        r = self.card_rect()
+        self._seek_to = 0.0
+        st = self.media.state
+        if st and st["dur"] > 0:
+            x0, w = self._bar_geom(r)
+            self._seek_to = clamp((ev.position().x() - x0) / max(1.0, w)) * st["dur"]
+        super().mousePressEvent(ev)
+
+    def _bar_geom(self, r):
+        size = self.cfg["size"]
+        if size == "m":
+            return r.x() + 166, r.right() - 18 - (r.x() + 166)
+        return r.x() + 24, r.width() - 48
+
+    def paint(self, p, r, th):
+        st = self.media.state
+        size = self.cfg["size"]
+        if not st or not st.get("title"):
+            draw_note(p, r.center().x(), r.y() + r.height() * 0.32, 34 if size != "s" else 30, YA_YELLOW)
+            msg = self.media.error or "Ничего не играет"
+            text(p, QRectF(r.x() + 12, r.y() + r.height() * 0.48, r.width() - 24, 20), msg, font(13, SEMI), WHITE)
+            pill = QRectF(r.center().x() - 90, r.y() + r.height() * 0.48 + 28, 180, 30)
+            if size == "s":
+                pill = QRectF(r.x() + 16, r.bottom() - 46, r.width() - 32, 30)
+            p.setPen(NOPEN)
+            p.setBrush(YA_YELLOW)
+            p.drawRoundedRect(pill, 15, 15)
+            text(p, pill, "Открыть Яндекс Музыку" if size != "s" else "Открыть", font(12, SEMI), QColor(20, 20, 20))
+            self.hit(pill, self.activate)
+            return
+        cover = st.get("cover")
+        src = app_title(st.get("app"))
+        if size == "s":
+            self._cover(p, QRectF(r.x(), r.y(), r.width(), r.height()), cover, RADIUS)
+            g = QLinearGradient(0, r.y() + 50, 0, r.bottom())
+            g.setColorAt(0, QColor(0, 0, 0, 0))
+            g.setColorAt(1, QColor(0, 0, 0, 200))
+            p.fillRect(r, g)
+            text(p, QRectF(r.x() + 14, r.bottom() - 56, r.width() - 64, 20), st["title"], font(13, SEMI), WHITE, AL | AVC)
+            text(p, QRectF(r.x() + 14, r.bottom() - 37, r.width() - 64, 18), st["artist"], font(11),
+                 QColor(255, 255, 255, 200), AL | AVC)
+            playing = st["playing"]
+            pc = QRectF(r.right() - 50, r.bottom() - 52, 38, 38)
+            p.setPen(NOPEN)
+            p.setBrush(YA_YELLOW)
+            p.drawEllipse(pc)
+            draw_media_icon(p, "pause" if playing else "play", pc.center().x() + (0 if playing else 1.5),
+                            pc.center().y(), 15, QColor(20, 20, 20))
+            self.hit(pc, lambda: self.media.command("toggle"))
+            self._eq(p, r.x() + 14, r.y() + 14, 12, playing)
+            return
+        if size == "m":
+            self._cover(p, QRectF(r.x() + 18, r.y() + 18, 134, 134), cover)
+            x0 = r.x() + 166
+            w = r.right() - 18 - x0
+            self._eq(p, x0, r.y() + 20, 11, st["playing"])
+            text(p, QRectF(x0 + 18, r.y() + 17, w - 18, 16), src.upper(), font(10, SEMI), YA_YELLOW, AL | AVC)
+            text(p, QRectF(x0, r.y() + 38, w, 22), st["title"], font(15, SEMI), WHITE, AL | AVC)
+            text(p, QRectF(x0, r.y() + 60, w, 18), st["artist"], font(12), QColor(255, 255, 255, 190), AL | AVC)
+            self._progress(p, QRectF(x0, r.y() + 90, w, 4), st)
+            self._controls(p, x0 + w / 2, r.y() + 134, 26, 56)
+            return
+        cs = 196
+        self._cover(p, QRectF(r.center().x() - cs / 2, r.y() + 24, cs, cs), cover, 16)
+        self._eq(p, r.x() + 20, r.y() + 20, 12, st["playing"])
+        text(p, QRectF(r.x() + 24, r.y() + 230, r.width() - 48, 24), st["title"], font(17, SEMI), WHITE)
+        text(p, QRectF(r.x() + 24, r.y() + 254, r.width() - 48, 18), st["artist"] + "  ·  " + src, font(12),
+             QColor(255, 255, 255, 190))
+        self._progress(p, QRectF(r.x() + 24, r.y() + 286, r.width() - 48, 4), st)
+        self._controls(p, r.center().x(), r.y() + 334, 30, 72)
+
+    def wheel(self, pos, delta):
+        if delta:
+            self.media.command("next" if delta < 0 else "prev")
+
+    def activate(self):
+        local = os.environ.get("LOCALAPPDATA", "")
+        open_target("yandexmusic://", os.path.join(local, "Programs", "YandexMusic", "Яндекс Музыка.exe"),
+                    "https://music.yandex.ru/")
+
+    def extra_menu(self, menu):
+        menu.addAction("Открыть Яндекс Музыку").triggered.connect(self.activate)
+        a = menu.addAction("Только Яндекс Музыка (не другие плееры)")
+        a.setCheckable(True)
+        a.setChecked(bool(self.mgr.cfg.get("music_only_yandex")))
+        a.toggled.connect(lambda v: self.mgr.set_opt("music_only_yandex", bool(v)))
+
+
+# ---------------------------------------------------------------------------
+#  Claude: мини-чат на рабочем столе (официальная библиотека anthropic)
+# ---------------------------------------------------------------------------
+CLAUDE_MODEL = "claude-opus-5-5"
+CLAUDE_SYSTEM = ("Ты помощник в маленьком виджете на рабочем столе Windows. Отвечай коротко и по делу, "
+                 "на языке пользователя. Форматируй Markdown умеренно: короткие списки и код допустимы, "
+                 "большие заголовки и таблицы - нет.")
+CLAUDE_ORANGE = QColor("#D97757")
+
+
+class ClaudeCard(Card):
+    KIND = "claude"
+    TITLE = "Claude"
+    SIZES = ("s", "m", "l", "xl")
+    DEFAULT_SIZE = "l"
+    _chunk = Signal(object, object)
+    _done = Signal(object, object)
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        self.msgs = []                      # история диалога для API
+        self.streaming = ""
+        self.busy = False
+        self.error = None
+        self.tok = 0
+        self._style_key = None
+        self.view = QTextBrowser(self)
+        self.view.setOpenExternalLinks(True)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
+        self.view.viewport().setAutoFillBackground(False)
+        self.input = QLineEdit(self)
+        self.input.setPlaceholderText("Спроси Claude…  (Enter - отправить)")
+        self.input.returnPressed.connect(self.send)
+        self._chunk.connect(self._on_chunk)
+        self._done.connect(self._on_done)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self.render)
+        self.layout_children()
+        self.render()
+
+    # ----- раскладка и вид -----
+    def layout_children(self):
+        r = self.card_rect()
+        small = self.cfg["size"] == "s"
+        self.view.setVisible(not small)
+        self.input.setVisible(not small)
+        if small:
+            return
+        self.view.setGeometry(int(r.x() + 14), int(r.y() + 46), int(r.width() - 28), int(r.height() - 46 - 58))
+        self.input.setGeometry(int(r.x() + 14), int(r.bottom() - 48), int(r.width() - 28), 34)
+
+    def size_changed(self):
+        self.layout_children()
+
+    def restyle(self, th):
+        key = (self.mgr.style_name(self.cfg),)
+        if key == self._style_key:
+            return
+        self._style_key = key
+        fg, fg2 = th["fg"].name(), th["fg2"].name()
+        light = th["light"]
+        field = "rgba(0,0,0,0.07)" if light else "rgba(255,255,255,0.10)"
+        border = "rgba(0,0,0,0.15)" if light else "rgba(255,255,255,0.18)"
+        self.view.setStyleSheet("QTextBrowser { background: transparent; color: %s; border: none; font-family: '%s';"
+                                " font-size: 13px; } QScrollBar:vertical { width: 6px; background: transparent; }"
+                                " QScrollBar::handle:vertical { background: %s; border-radius: 3px; min-height: 20px; }"
+                                " QScrollBar::add-line, QScrollBar::sub-line { height: 0; }"
+                                % (fg, FONT, border))
+        self.input.setStyleSheet("QLineEdit { background: %s; color: %s; border: 1px solid %s; border-radius: 17px;"
+                                 " padding: 0 14px; font-family: '%s'; font-size: 13px; }"
+                                 " QLineEdit:focus { border: 1px solid %s; }"
+                                 % (field, fg, border, FONT, CLAUDE_ORANGE.name()))
+        self._fg2 = fg2
+        link = "#8A3B1F" if light else "#F0A07E"
+        self._link = QColor(link)
+        self.render()
+
+    def render(self):
+        th = self.theme
+        fg2 = th["fg2"].name()
+        parts = []
+        if not self.msgs and not self.busy:
+            if not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY") and self.cfg["size"] == "m":
+                parts.append("**Нужен API-ключ Claude.** Правая кнопка по виджету → «API-ключ Claude...». "
+                             "Создать ключ: [platform.claude.com](https://platform.claude.com/settings/keys)")
+            elif not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY"):
+                parts.append("**Чтобы общаться с Claude, нужен API-ключ.**\n\n"
+                             "1. Открой [platform.claude.com](https://platform.claude.com/settings/keys) и создай ключ.\n"
+                             "2. Правая кнопка по виджету → «API-ключ Claude...» и вставь его.\n\n"
+                             "Ключ хранится на этом компьютере в зашифрованном виде. Запросы платные по тарифам API.\n\n"
+                             "Без ключа: двойной клик по заголовку откроет claude.ai в браузере.")
+            else:
+                parts.append("Привет! Спроси что-нибудь: перевести текст, объяснить ошибку, придумать идею…")
+        for m in self.msgs:
+            if m["role"] == "user":
+                parts.append("<p style='color:%s'><b>Вы:</b> %s</p>" % (fg2, m["content"].replace("<", "&lt;")))
+            else:
+                parts.append(m["content"])
+        if self.busy:
+            parts.append(self.streaming or "<i style='color:%s'>Думаю…</i>" % fg2)
+        if self.error:
+            parts.append("<p style='color:#FF6B6B'>%s</p>" % self.error)
+        app = QApplication.instance()                 # Markdown берёт цвет ссылок из палитры приложения
+        pal = app.palette()
+        link = getattr(self, "_link", None) or QColor("#F0A07E")
+        pal.setColor(QPalette.ColorRole.Link, link)
+        pal.setColor(QPalette.ColorRole.LinkVisited, link)
+        app.setPalette(pal)
+        self.view.setMarkdown("\n\n".join(parts))
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def api_key(self):
+        return secret_reveal(self.mgr.cfg.get("claude_key"))
+
+    # ----- запрос -----
+    def send(self):
+        q = self.input.text().strip()
+        if not q or self.busy:
+            return
+        if not DEMO and not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY"):
+            self.ask_key()
+            if not self.api_key():
+                return
+        self.input.clear()
+        self.msgs.append({"role": "user", "content": q})
+        self.busy, self.streaming, self.error = True, "", None
+        self.tok += 1
+        tok, history, key = self.tok, list(self.msgs), self.api_key()
+        self.render()
+        self.update()
+        threading.Thread(target=self._work, args=(tok, history, key), daemon=True).start()
+
+    def _emit(self, sig, *args):
+        try:
+            sig.emit(*args)
+        except RuntimeError:
+            pass
+
+    def _work(self, tok, history, key):
+        if DEMO:
+            for word in ("Это **тестовый** ответ виджета. ", "Здесь появится ответ Claude, ",
+                         "который печатается по мере генерации."):
+                time.sleep(0.15)
+                self._emit(self._chunk, tok, word)
+            self._emit(self._done, tok, None)
+            return
+        try:
+            import anthropic
+        except ImportError:
+            pip_install("anthropic")
+            try:
+                import anthropic
+            except ImportError:
+                self._emit(self._done, tok, "Нет библиотеки anthropic. Выполни: pip install anthropic")
+                return
+        err = None
+        try:
+            client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+            params = dict(model=CLAUDE_MODEL, max_tokens=64000, system=CLAUDE_SYSTEM, messages=history)
+            try:
+                # если запрос отклонят фильтры безопасности, API сам повторит его на подходящей модели
+                ctx = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+                                                  **params)
+            except TypeError:                            # старая версия библиотеки без fallbacks
+                ctx = client.messages.stream(**params)
+            with ctx as stream:
+                for piece in stream.text_stream:
+                    self._emit(self._chunk, tok, piece)
+                final = stream.get_final_message()
+            if final.stop_reason == "refusal":
+                err = "Claude не стал отвечать на этот запрос."
+            elif final.stop_reason == "max_tokens":
+                err = "Ответ получился слишком длинным и обрезан."
+        except anthropic.AuthenticationError:
+            err = "Неверный API-ключ. Правая кнопка → «API-ключ Claude...»"
+        except anthropic.PermissionDeniedError:
+            err = "У ключа нет доступа к этой модели."
+        except anthropic.RateLimitError:
+            err = "Слишком много запросов - подожди минутку."
+        except anthropic.APIStatusError as ex:
+            err = "Ошибка сервера Claude (%s). Попробуй ещё раз." % ex.status_code
+        except anthropic.APIConnectionError:
+            err = "Нет связи с сервером Claude."
+        except anthropic.AnthropicError as ex:
+            err = "Не получилось: %s" % (str(ex)[:160] or "нужен API-ключ")
+        except Exception as ex:
+            err = "Не получилось: %s" % str(ex)[:160]
+        self._emit(self._done, tok, err)
+
+    def _on_chunk(self, tok, piece):
+        if tok != self.tok:
+            return
+        self.streaming += piece
+        if not self._render_timer.isActive():
+            self._render_timer.start(60)
+
+    def _on_done(self, tok, err):
+        if tok != self.tok:
+            return
+        self.busy = False
+        if self.streaming.strip():
+            self.msgs.append({"role": "assistant", "content": self.streaming})
+        elif self.msgs and self.msgs[-1]["role"] == "user":
+            self.msgs.pop()                       # ответа нет - вопрос из истории убираем
+        self.streaming, self.error = "", err
+        self.render()
+        self.update()
+
+    def new_chat(self):
+        self.tok += 1
+        self.msgs, self.streaming, self.busy, self.error = [], "", False, None
+        self.render()
+        self.update()
+
+    def ask_key(self):
+        key, ok = QInputDialog.getText(None, "API-ключ Claude",
+                                       "Вставь API-ключ (начинается с sk-ant-).\n"
+                                       "Создать: platform.claude.com → Settings → API keys.",
+                                       QLineEdit.EchoMode.Password)
+        if ok and key.strip():
+            self.mgr.set_opt("claude_key", secret_protect(key.strip()))
+            self.render()
+
+    # ----- рисование -----
+    def paint(self, p, r, th):
+        self.restyle(th)
+        if self.cfg["size"] == "s":
+            draw_bubble(p, r.center().x(), r.y() + 62, 64, WHITE if th["mode"] == "color" else CLAUDE_ORANGE)
+            text(p, QRectF(r.x(), r.y() + 104, r.width(), 22), "Claude", font(16, SEMI), th["fg"])
+            text(p, QRectF(r.x() + 8, r.y() + 126, r.width() - 16, 18), "Спросить в чате", font(12), th["fg2"])
+            return
+        draw_bubble(p, r.x() + 30, r.y() + 24, 24, WHITE if th["mode"] == "color" else CLAUDE_ORANGE, dots=False)
+        text(p, QRectF(r.x() + 50, r.y() + 12, 120, 24), "Claude", font(15, SEMI), th["fg"], AL | AVC)
+        if self.busy:
+            t = time.time()
+            for i in range(3):
+                a = 0.3 + 0.7 * abs(math.sin(t * 4 - i * 0.6))
+                c = QColor(WHITE if th["mode"] == "color" else CLAUDE_ORANGE)
+                c.setAlphaF(a)
+                p.setPen(NOPEN)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(r.x() + 118 + i * 9, r.y() + 24), 2.6, 2.6)
+            self.want_frame(40)
+        nb = QRectF(r.right() - 44, r.y() + 10, 28, 28)
+        p.setPen(NOPEN)
+        p.setBrush(th["btn"])
+        p.drawEllipse(nb.center(), 13, 13)
+        pen = QPen(th["fg"], 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        c = nb.center()
+        p.drawLine(QPointF(c.x() - 5, c.y()), QPointF(c.x() + 5, c.y()))
+        p.drawLine(QPointF(c.x(), c.y() - 5), QPointF(c.x(), c.y() + 5))
+        self.hit(nb, self.new_chat)
+        text(p, QRectF(r.right() - 200, r.y() + 12, 150, 24), "Opus 5.5", font(11), th["fg2"], AR | AVC)
+
+    def clicked(self, pos):
+        if self.cfg["size"] == "s":
+            self.activate()
+        else:
+            self.activateWindow()
+            self.input.setFocus()
+
+    def activate(self):
+        local = os.environ.get("LOCALAPPDATA", "")
+        open_target(os.path.join(local, "AnthropicClaude", "claude.exe"), "https://claude.ai/new")
+
+    def extra_menu(self, menu):
+        menu.addAction("Новый чат").triggered.connect(self.new_chat)
+        menu.addAction("API-ключ Claude...").triggered.connect(self.ask_key)
+        if self.mgr.cfg.get("claude_key"):
+            menu.addAction("Удалить сохранённый ключ").triggered.connect(
+                lambda: (self.mgr.cfg.pop("claude_key", None), self.mgr.save(), self.render()))
+        menu.addAction("Открыть claude.ai").triggered.connect(lambda: open_target("https://claude.ai/new"))
+
+
+# ---------------------------------------------------------------------------
+#  Discord: кто в сети на твоём сервере (официальный виджет сервера Discord)
+# ---------------------------------------------------------------------------
+DISCORD_BLURPLE = QColor("#5865F2")
+DISCORD_STATUS = {"online": QColor("#23A55A"), "idle": QColor("#F0B232"), "dnd": QColor("#F23F43")}
+
+
+def demo_discord():
+    names = [("Снеговик", "online", "Minecraft"), ("Лиса", "idle", None), ("Пельмень", "dnd", "Dota 2"),
+             ("Кот Борис", "online", None), ("Ёлка", "online", "Spotify"), ("Мандарин", "online", None),
+             ("Зима", "idle", None), ("Сугроб", "online", "CS2")]
+    members = []
+    for i, (n, s, g) in enumerate(names):
+        m = {"id": str(i), "username": n, "status": s, "avatar_url": ""}
+        if g:
+            m["game"] = {"name": g}
+        if i in (0, 3, 5):
+            m["channel_id"] = "v1"
+        members.append(m)
+    return {"id": "1", "name": "Снежный сервер", "presence_count": 42, "instant_invite": "https://discord.gg/example",
+            "channels": [{"id": "v1", "name": "Общий голосовой", "position": 0},
+                         {"id": "v2", "name": "Игры", "position": 1}], "members": members}
+
+
+class DiscordCard(Card):
+    KIND = "discord"
+    TITLE = "Discord"
+    DEFAULT_SIZE = "m"
+    _got = Signal(object, object, object)
+    _ava = Signal(object, object)
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        self.data = cfg.get("cache")
+        self.error = None
+        self.busy = False
+        self.avatars = {}
+        self._got.connect(self._on_data)
+        self._ava.connect(self._on_avatar)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(2 * 60 * 1000)
+        QTimer.singleShot(300, self.refresh)
+
+    # ----- данные -----
+    def refresh(self):
+        gid = self.cfg.get("guild")
+        if self.busy or (not gid and not DEMO):
+            return
+        self.busy = True
+
+        def work():
+            data, err = None, None
+            try:
+                if DEMO:
+                    data = demo_discord()
+                else:
+                    data = http_json("https://discord.com/api/guilds/%s/widget.json" % gid)
+            except urllib.error.HTTPError as ex:
+                err = ("У сервера выключен виджет: Настройки сервера → Виджет → «Включить виджет сервера»"
+                       if ex.code == 403 else "Сервер не найден - проверь ID" if ex.code in (400, 404)
+                       else "Discord ответил ошибкой %d" % ex.code)
+            except Exception:
+                err = "Нет связи с Discord"
+            self._emit(self._got, gid, data, err)
+            for m in ((data or {}).get("members") or [])[:16]:
+                url = m.get("avatar_url")
+                if not url or m.get("id") in self.avatars:
+                    continue
+                try:
+                    req = urllib.request.Request(url, headers=UA)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        img = QImage.fromData(resp.read())
+                    if not img.isNull():
+                        self._emit(self._ava, m["id"], img)
+                except Exception:
+                    continue
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _emit(self, sig, *args):
+        try:
+            sig.emit(*args)
+        except RuntimeError:
+            pass
+
+    def _on_data(self, gid, data, err):
+        self.busy = False
+        self.error = err
+        if data is not None:
+            self.data = data
+            self.cfg["cache"] = data
+            self.mgr.save()
+        self.update()
+
+    def _on_avatar(self, mid, img):
+        self.avatars[mid] = img.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                       Qt.TransformationMode.SmoothTransformation)
+        self.update()
+
+    # ----- рисование -----
+    def _avatar(self, p, m, cx, cy, rad, th):
+        img = self.avatars.get(m.get("id"))
+        p.save()
+        path = QPainterPath()
+        path.addEllipse(QPointF(cx, cy), rad, rad)
+        if img is not None:
+            p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+            p.drawImage(QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), img)
+            p.setClipping(False)
+        else:
+            hue = (sum(map(ord, m.get("username", "?"))) * 37) % 360
+            p.setPen(NOPEN)
+            p.setBrush(QColor.fromHsv(hue, 120, 200))
+            p.drawPath(path)
+            text(p, QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), (m.get("username") or "?")[:1].upper(),
+                 font(rad * 0.95, SEMI), WHITE)
+        p.restore()
+        col = DISCORD_STATUS.get(m.get("status"), DISCORD_STATUS["online"])
+        p.setPen(QPen(th["bg2"] if th["mode"] != "color" else QColor(self.kind_colors()[1]), max(2.0, rad * 0.16)))
+        p.setBrush(col)
+        p.drawEllipse(QPointF(cx + rad * 0.72, cy + rad * 0.72), rad * 0.3, rad * 0.3)
+
+    def _header(self, p, r, th, d):
+        draw_bubble(p, r.x() + 30, r.y() + 25, 24, DISCORD_BLURPLE if th["mode"] != "color" else WHITE, dots=False)
+        text(p, QRectF(r.x() + 50, r.y() + 12, r.width() - 160, 24), d.get("name") or "Discord", font(15, SEMI),
+             th["fg"], AL | AVC)
+        online = int(d.get("presence_count") or 0)
+        pill = QRectF(r.right() - 104, r.y() + 13, 88, 22)
+        p.setPen(NOPEN)
+        p.setBrush(th["btn"])
+        p.drawRoundedRect(pill, 11, 11)
+        p.setBrush(DISCORD_STATUS["online"])
+        p.drawEllipse(QPointF(pill.x() + 13, pill.center().y()), 4, 4)
+        text(p, pill.adjusted(22, 0, -6, 0), "%d в сети" % online, font(11, SEMI), th["fg"], AL | AVC)
+
+    def voice(self, d):
+        chans = {c["id"]: c for c in d.get("channels") or []}
+        groups = {}
+        for m in d.get("members") or []:
+            if m.get("channel_id") in chans:
+                groups.setdefault(m["channel_id"], []).append(m)
+        return [(chans[k], v) for k, v in sorted(groups.items(), key=lambda kv: chans[kv[0]].get("position", 0))]
+
+    def paint(self, p, r, th):
+        d = self.data
+        size = self.cfg["size"]
+        if not d:
+            draw_bubble(p, r.center().x(), r.y() + r.height() * 0.3, 40, DISCORD_BLURPLE, dots=False)
+            msg = self.error or ("Загружаю…" if self.cfg.get("guild") else "Нажми, чтобы подключить свой сервер")
+            p.setFont(font(12))
+            p.setPen(th["fg2"])
+            p.drawText(QRectF(r.x() + 14, r.y() + r.height() * 0.48, r.width() - 28, r.height() * 0.5),
+                       int(AC | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
+            return
+        members = d.get("members") or []
+        if size == "s":
+            draw_bubble(p, r.x() + 28, r.y() + 26, 22, DISCORD_BLURPLE if th["mode"] != "color" else WHITE, dots=False)
+            text(p, QRectF(r.x() + 46, r.y() + 14, r.width() - 60, 24), d.get("name") or "", font(13, SEMI),
+                 th["fg"], AL | AVC)
+            online = self.av("online", float(d.get("presence_count") or 0), 4.0, start=0.0)
+            text(p, QRectF(r.x() + 16, r.y() + 42, r.width() - 32, 50), str(int(round(online))), font(42, LIGHT),
+                 th["fg"], AL | AVC)
+            p.setPen(NOPEN)
+            p.setBrush(DISCORD_STATUS["online"])
+            p.drawEllipse(QPointF(r.x() + 21, r.y() + 102), 4, 4)
+            text(p, QRectF(r.x() + 30, r.y() + 93, r.width() - 40, 18), "в сети", font(12), th["fg2"], AL | AVC)
+            for i, m in enumerate(members[:5]):
+                self._avatar(p, m, r.x() + 30 + i * 26, r.bottom() - 30, 13, th)
+            return
+        self._header(p, r, th, d)
+        if size == "m":
+            n = min(8, len(members))
+            for i, m in enumerate(members[:n]):
+                self._avatar(p, m, r.x() + 36 + i * 41, r.y() + 74, 17, th)
+            y = r.y() + 106
+            vc = self.voice(d)
+            if vc:
+                for ch, ms in vc[:2]:
+                    text(p, QRectF(r.x() + 20, y, r.width() - 40, 20), "🔊 %s — %d" % (ch["name"], len(ms)),
+                         font(12), th["fg2"], AL | AVC)
+                    y += 22
+            else:
+                games = [m for m in members if m.get("game")]
+                line = ", ".join("%s: %s" % (m["username"], m["game"]["name"]) for m in games[:3]) or "Никто не в голосовых каналах"
+                p.setFont(font(12))
+                p.setPen(th["fg2"])
+                p.drawText(QRectF(r.x() + 20, y, r.width() - 40, 44),
+                           int(AL | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), line)
+            return
+        y = r.y() + 50
+        vc = self.voice(d)
+        for ch, ms in vc[:2]:
+            text(p, QRectF(r.x() + 20, y, r.width() - 40, 18), "🔊 " + ch["name"], font(12, SEMI), th["accent"], AL | AVC)
+            y += 20
+            for i, m in enumerate(ms[:6]):
+                self._avatar(p, m, r.x() + 32 + i * 32, y + 14, 12, th)
+            y += 34
+        if vc:
+            p.setPen(QPen(th["line"], 1))
+            p.drawLine(QPointF(r.x() + 20, y), QPointF(r.right() - 20, y))
+            y += 6
+        row = 38
+        for m in members:
+            if y + row > r.bottom() - 8:
+                break
+            self._avatar(p, m, r.x() + 36, y + row / 2, 14, th)
+            game = (m.get("game") or {}).get("name")
+            if game:
+                text(p, QRectF(r.x() + 60, y + 2, r.width() - 80, 18), m.get("username", ""), font(13, SEMI),
+                     th["fg"], AL | AVC)
+                text(p, QRectF(r.x() + 60, y + 19, r.width() - 80, 16), "Играет в " + game, font(11), th["fg2"],
+                     AL | AVC)
+            else:
+                text(p, QRectF(r.x() + 60, y, r.width() - 80, row), m.get("username", ""), font(13, SEMI), th["fg"],
+                     AL | AVC)
+            y += row
+
+    # ----- действия -----
+    def clicked(self, pos):
+        if not self.cfg.get("guild") and not DEMO:
+            self.ask_guild()
+
+    def activate(self):
+        gid = self.cfg.get("guild") or ""
+        open_target("discord://-/channels/%s" % gid if gid else "discord://",
+                    "https://discord.com/channels/%s" % gid if gid else "https://discord.com/app")
+
+    def ask_guild(self):
+        val, ok = QInputDialog.getText(
+            None, "Discord - мой сервер",
+            "1. Discord → Настройки сервера → Виджет → включи «Включить виджет сервера».\n"
+            "2. На той же странице скопируй «ID сервера» и вставь сюда\n"
+            "    (подойдёт и ссылка вида discord.com/channels/123456...).",
+            text=self.cfg.get("guild") or "")
+        if not ok:
+            return
+        import re
+        nums = re.findall(r"\d{15,22}", val)
+        if not nums:
+            self.error = "Не нашёл ID сервера (это длинное число)"
+            self.update()
+            return
+        self.cfg["guild"] = nums[0]
+        self.cfg.pop("cache", None)
+        self.data, self.error, self.avatars = None, None, {}
+        self.mgr.save()
+        self.update()
+        self.refresh()
+
+    def extra_menu(self, menu):
+        menu.addAction("Указать сервер...").triggered.connect(self.ask_guild)
+        menu.addAction("Обновить").triggered.connect(self.refresh)
+        menu.addAction("Открыть Discord").triggered.connect(self.activate)
+        inv = (self.data or {}).get("instant_invite")
+        if inv:
+            menu.addAction("Скопировать приглашение").triggered.connect(
+                lambda: QApplication.clipboard().setText(inv))
+
+    def closing(self):
+        self.timer.stop()
+
+
+KINDS = {c.KIND: c for c in (WeatherCard, MusicCard, BatteryCard, PhotoCard, CalendarCard, ClockCard,
+                                SystemCard, ClaudeCard, DiscordCard)}
 
 
 # ---------------------------------------------------------------------------
@@ -2801,6 +3946,12 @@ class Manager(QObject):
         except Exception:
             pass
         return {"style": "dark", "opacity": 1.0, "locked": False, "animations": True, "widgets": []}
+
+    def media(self):
+        """Общий опрос плеера (создаётся, когда появляется первый виджет музыки)."""
+        if getattr(self, "_media", None) is None:
+            self._media = MediaService(self)
+        return self._media
 
     def style_name(self, wcfg):
         name = wcfg.get("style") or self.cfg.get("style") or "dark"

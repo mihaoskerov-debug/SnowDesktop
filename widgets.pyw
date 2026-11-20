@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -182,6 +182,14 @@ def log_error(where):
     try:
         with open(os.path.join(DATA_DIR, "widgets_error.log"), "a", encoding="utf-8") as fh:
             fh.write("%s  v%s  %s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), APP_VERSION, where, tb))
+    except Exception:
+        pass
+
+
+def log_error_text(msg):
+    try:
+        with open(os.path.join(DATA_DIR, "widgets_error.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s  v%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), APP_VERSION, msg))
     except Exception:
         pass
 
@@ -1260,6 +1268,21 @@ class Card(QWidget):
 
     # ----- рисование -----
     def paintEvent(self, _ev):
+        self._last_paint = time.time()
+        try:
+            self._paint_frame()
+        except Exception:
+            log_error("кадр виджета %s" % self.KIND)
+            self.want_frame(500)
+        finally:
+            self._wanted = self._frame_ms
+            self._schedule()
+
+    def needs_frames(self):
+        """Виджет сейчас анимируется и ждёт следующего кадра не дольше пары секунд."""
+        return 0 < getattr(self, "_wanted", 0) <= 2000 and self.isVisible()
+
+    def _paint_frame(self):
         now = time.time()
         self._dt = clamp(now - self._t_last, 0.0, 0.05)
         self._t_last = now
@@ -1288,6 +1311,13 @@ class Card(QWidget):
             self._schedule()
             return
         p = QPainter(self)
+        try:
+            self._paint_card(p, e, press)
+        finally:
+            if p.isActive():
+                p.end()
+
+    def _paint_card(self, p, e, press):
         p.setRenderHints(RH)
         r = self.card_rect()
         th = self.theme
@@ -1318,11 +1348,11 @@ class Card(QWidget):
         path.addRoundedRect(r, RADIUS, RADIUS)
         p.save()
         p.setClipPath(path)
-        p.save()
-        p.setOpacity(p.opacity() * op)
-        self.paint_bg(p, path, r, th)
-        p.restore()
         try:
+            p.save()
+            p.setOpacity(p.opacity() * op)
+            self.paint_bg(p, path, r, th)
+            p.restore()
             self.paint(p, r, th)
             if th["mode"] == "winter":
                 self.paint_snowcap(p, r)
@@ -1339,8 +1369,6 @@ class Card(QWidget):
         else:
             p.setPen(QPen(th["line"], 1))
         p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), RADIUS, RADIUS)
-        p.end()
-        self._schedule()
 
     def _schedule(self):
         if self._frame_ms and not self._ft.isActive():
@@ -2853,16 +2881,39 @@ class MediaService(QObject):
         self.session = None
         self._got.connect(self._on)
         self._demo_play = True
-        threading.Thread(target=self._run, daemon=True).start()
+        self.gen = 0
+        self.last_payload = time.time()
+        self.dead_since = None
+        self.none_count = 0
+        self._start()
+
+    def _start(self):
+        self.gen += 1
+        self.last_payload = time.time()
+        self.dead_since = None
+        threading.Thread(target=self._run, args=(self.gen,), daemon=True).start()
+
+    def watch(self):
+        """Вызывается раз в 2 с: если опрос завис или умер - запускаем новый."""
+        if DEMO or not IS_WIN:
+            return
+        now = time.time()
+        if self.dead_since is not None and now - self.dead_since > 30:
+            self.log("переподключаюсь к плееру после ошибки")
+            self._start()
+        elif self.dead_since is None and now - self.last_payload > 15:
+            self.log("опрос плеера не отвечает %.0f с - запускаю заново" % (now - self.last_payload))
+            self._start()
 
     # ----- поток опроса -----
-    def _emit(self, payload):
+    def _emit(self, payload, gen=None):
+        payload["gen"] = gen if gen is not None else self.gen
         try:
             self._got.emit(payload)
         except RuntimeError:
             pass
 
-    def _run(self):
+    def _run(self, gen):
         if DEMO:
             img = None
             for path in list_images(os.path.join(os.path.expanduser("~"), "Downloads", "Telegram Desktop"), False)[:1]:
@@ -2883,15 +2934,23 @@ class MediaService(QObject):
             if pip_install(*_WINRT_PKGS):
                 mods = _winrt_try()
         if mods is None:
-            self._emit({"error": "Нет компонента winrt. Выполни: pip install " + " ".join(_WINRT_PKGS)})
+            self._emit({"error": "Нет компонента winrt. Выполни: pip install " + " ".join(_WINRT_PKGS),
+                        "dead": True}, gen)
             return
         import asyncio
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = loop
         try:
-            self.loop.run_until_complete(self._poll(mods))
-        except Exception:
-            self._emit({"error": "Не удалось подключиться к плееру Windows"})
+            loop.run_until_complete(self._poll(mods, gen))
+        except Exception as ex:
+            self.log("опрос остановился: %r" % (ex,))
+            self._emit({"error": "Не удалось подключиться к плееру Windows", "dead": True}, gen)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     def log(self, msg):
         """Журнал ошибок связи с плеером: %APPDATA%\\SnowWidgets\\music.log (последние 300 строк)."""
@@ -2932,6 +2991,17 @@ class MediaService(QObject):
             self.log("обложка: %r" % (ex,))
             return None
 
+    def _log_sessions(self, mgr, why):
+        now = time.time()
+        if now - getattr(self, "_sess_logged", 0) < 60:
+            return
+        self._sess_logged = now
+        try:
+            items = ["%s(статус %s)" % (x.source_app_user_model_id, self._status(x)) for x in mgr.get_sessions()]
+        except Exception as ex:
+            items = ["ошибка: %r" % (ex,)]
+        self.log("%s; плееры в Windows: %s" % (why, ", ".join(items) or "нет"))
+
     @staticmethod
     def _status(s):
         try:
@@ -2966,12 +3036,12 @@ class MediaService(QObject):
         except Exception:
             return sessions[0] if sessions else None
 
-    async def _poll(self, mods):
+    async def _poll(self, mods, gen):
         import asyncio
         mc, ss = mods
         mgr = None
         last_key, cover, fails = None, None, 0
-        while True:
+        while gen == self.gen:                              # старый поток тихо завершится после перезапуска
             st = None
             try:
                 if mgr is None or fails >= 5:              # после череды ошибок подключаемся заново
@@ -2979,6 +3049,8 @@ class MediaService(QObject):
                     fails = 0
                 s = self._pick(mgr)
                 self.session = s
+                if s is None:
+                    self._log_sessions(mgr, "нет подходящего плеера")
                 if s is not None:
                     props = await asyncio.wait_for(s.try_get_media_properties_async(), 3)
                     title = (props.title or "").strip()
@@ -3020,18 +3092,29 @@ class MediaService(QObject):
                 fails += 1
                 self.log("опрос: %r" % (ex,))
                 st = "keep"                                 # временная ошибка - не стираем трек с экрана
-            self._emit({"state": st})
+            self._emit({"state": st}, gen)
             await asyncio.sleep(1.0)
 
     def _on(self, payload):
+        if payload.get("gen") != self.gen:
+            return                                          # сообщение от старого (перезапущенного) опроса
+        self.last_payload = time.time()
         if "error" in payload:
             self.error = payload["error"]
+            if payload.get("dead"):
+                self.dead_since = time.time()
             self.updated.emit()
             return
         self.error = None
         st = payload["state"]
         if st == "keep":
             return
+        if st is None:
+            self.none_count += 1
+            if self.state and self.none_count < 4:          # плеер "моргнул" - пару секунд ничего не меняем
+                return
+        else:
+            self.none_count = 0
         if st is None and self.state:
             # плеер пропал (приложение закрыли, вкладку поставили на паузу) - показываем последний трек
             # как остановленный ещё 30 минут, а не пустой виджет
@@ -3495,6 +3578,15 @@ class MusicCard(Card):
     def paint(self, p, r, th):
         st = self.media.state
         size = self.cfg["size"]
+        if not st or not st.get("title"):
+            pk = _METER.peak()
+            if pk is not None and pk > 0.02:
+                self._sound_t = time.time()
+            if time.time() - getattr(self, "_sound_t", 0) < 3.0:
+                # звук идёт, а название Windows не отдала - всё равно показываем живую пластинку
+                st = {"title": "Играет музыка", "artist": "название трека не пришло от плеера", "album": "",
+                      "app": "", "playing": True, "pos": 0.0, "dur": 0.0, "stamp": time.time(), "cover": None,
+                      "key": None, "status": 4}
         playing = bool(st and st.get("title") and st["playing"])
         # звук по громкости считаем "игрой", только если плеер не сказал прямо "пауза"/"стоп"
         slide = self._tick(playing, bool(st and st.get("title")) and (st or {}).get("status") not in (3, 5))
@@ -3716,6 +3808,9 @@ class Manager(QObject):
                 card.appear(0.15 + i * 0.09)            # виджеты появляются по очереди
         if first:
             self.save()
+        self.watchdog = QTimer(self)                  # сторож: замершие анимации и опрос плеера
+        self.watchdog.timeout.connect(self.watch)
+        self.watchdog.start(2000)
         self.wall_timer = QTimer(self)                # сменились обои - обновить "стекло"
         self.wall_timer.timeout.connect(self.check_wallpaper)
         self.wall_timer.start(20 * 1000)
@@ -3748,6 +3843,32 @@ class Manager(QObject):
         except Exception:
             pass
         return {"style": "dark", "opacity": 1.0, "locked": False, "animations": True, "widgets": []}
+
+    def watch(self):
+        now = time.time()
+        for c in self.cards:
+            try:
+                if not c.needs_frames():
+                    c._stalls = 0
+                    continue
+                late = now - getattr(c, "_last_paint", now)
+                if late < max(2.0, c._wanted / 1000.0 * 4):
+                    c._stalls = 0
+                    continue
+                c._stalls = getattr(c, "_stalls", 0) + 1
+                c._ft.stop()
+                if c._stalls >= 3:                         # окно перестало перерисовываться - показываем заново
+                    log_error_text("анимация виджета %s стояла %.0f с, окно показано заново (visible=%s)"
+                                   % (c.KIND, late, c.isVisible()))
+                    c.hide()
+                    c.show()
+                    c._stalls = 0
+                c.update()
+            except Exception:
+                log_error("сторож")
+        m = getattr(self, "_media", None)
+        if m is not None:
+            m.watch()
 
     def media(self):
         """Общий опрос плеера (создаётся, когда появляется первый виджет музыки)."""

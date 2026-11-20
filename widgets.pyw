@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.10"
+APP_VERSION = "1.11"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -50,6 +50,37 @@ except Exception:
     DATA_DIR = HERE
 CONFIG_FILE = os.path.join(DATA_DIR, "widgets.json")
 NO_WINDOW = 0x08000000                 # CREATE_NO_WINDOW: без мелькающей консоли
+
+
+def pythonw_exe():
+    """pythonw.exe рядом с текущим python.exe - он запускает программы без окна консоли."""
+    exe = sys.executable
+    pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    return pw if (IS_WIN and os.path.exists(pw)) else exe
+
+
+def hide_console():
+    """Если виджеты открылись через python.exe и Windows показала для них чёрное окно консоли -
+    прячем его и отключаемся от него (оно закроется). Консоль, из которой запустили вручную, не трогаем."""
+    if not IS_WIN or FROZEN:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd:
+            return                                   # уже без консоли (pythonw.exe)
+        procs = (ctypes.c_uint32 * 8)()
+        if k32.GetConsoleProcessList(procs, 8) > 1:
+            return                                   # запущено из открытой командной строки - это её окно
+        ctypes.windll.user32.ShowWindow(hwnd, 0)     # SW_HIDE
+        k32.FreeConsole()
+        devnull = open(os.devnull, "w")
+        sys.stdout = sys.stderr = devnull
+    except Exception:
+        pass
+
+
+hide_console()
 
 
 def msgbox(text, title="Виджеты", flags=0x40):
@@ -85,7 +116,7 @@ def ensure_deps():
                "    pip install PySide6 hidapi\n"
                "Потом запусти widgets.pyw снова.", "Виджеты - ошибка", 0x10)
         sys.exit(1)
-    subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+    subprocess.Popen([pythonw_exe(), os.path.abspath(__file__)] + sys.argv[1:], creationflags=NO_WINDOW)
     sys.exit(0)
 
 
@@ -3686,23 +3717,26 @@ class MusicCard(Card):
                     "https://music.yandex.ru/")
 
     def install_winrt(self):
-        """Поставить компонент связи с плеером в видимом окне консоли, потом перезапустить виджеты."""
-        exe = sys.executable
-        if exe.lower().endswith("pythonw.exe"):
-            exe = exe[:-5] + ".exe"
-        cmd = '"%s" -m pip install %s & echo. & echo Готово - виджеты перезапустятся. & timeout /t 3' % (
-            exe, " ".join(_WINRT_PKGS))
-        try:
-            proc = subprocess.Popen(["cmd", "/c", cmd], creationflags=0x00000010)      # CREATE_NEW_CONSOLE
-        except Exception:
-            log_error("установка winrt")
+        """Тихо (без окна консоли) поставить компонент связи с плеером, потом перезапустить виджеты."""
+        if getattr(self, "_installing", False):
             return
+        self._installing = True
+        self.media.reason = "устанавливаю компонент... (1-2 минуты)"
+        self.update()
+        done = {"ok": None}
+        threading.Thread(target=lambda: done.update(ok=pip_install(*_WINRT_PKGS)), daemon=True).start()
         self._pip_timer = QTimer(self)
 
         def check():
-            if proc.poll() is not None:               # окно установки закрылось - перезапускаемся
-                self._pip_timer.stop()
+            if done["ok"] is None:
+                return
+            self._pip_timer.stop()
+            self._installing = False
+            if done["ok"] and _winrt_try() is not None:
                 self.mgr.restart()
+            else:
+                self.media.reason = "не получилось установить компонент - проверь интернет"
+                self.update()
 
         self._pip_timer.timeout.connect(check)
         self._pip_timer.start(1000)
@@ -3756,11 +3790,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 def autostart_command():
     if FROZEN:
         return '"%s"' % sys.executable
-    exe = sys.executable
-    pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-    if os.path.exists(pw):
-        exe = pw
-    return '"%s" "%s"' % (exe, os.path.abspath(__file__))
+    return '"%s" "%s"' % (pythonw_exe(), os.path.abspath(__file__))
 
 
 def autostart_get():
@@ -4155,6 +4185,8 @@ class Manager(QObject):
                 a.setCheckable(True)
                 a.setChecked(autostart_get())
                 a.toggled.connect(lambda v: autostart_set(bool(v)))
+            if IS_WIN and not FROZEN:
+                menu.addAction("Ярлык на рабочем столе (запуск без консоли)").triggered.connect(self.make_shortcut)
             menu.addAction("Папка с настройками").triggered.connect(
                 lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR)))
             menu.addSeparator()
@@ -4167,15 +4199,29 @@ class Manager(QObject):
         tray.show()
         self.tray, self._menu = tray, menu
 
+    def make_shortcut(self):
+        """Ярлык "Виджеты" на рабочем столе: запускает через pythonw.exe, то есть без чёрного окна."""
+        script = os.path.abspath(__file__).replace("'", "''")
+        exe = pythonw_exe().replace("'", "''")
+        ps = ("$d=[Environment]::GetFolderPath('Desktop'); "
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Виджеты.lnk')); "
+              "$s.TargetPath='%s'; $s.Arguments='\"%s\"'; $s.WorkingDirectory='%s'; "
+              "$s.IconLocation='%s,0'; $s.Save()" % (exe, script, os.path.dirname(script), exe))
+        try:
+            res = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                  "-Command", ps], capture_output=True, timeout=30, creationflags=NO_WINDOW)
+            ok = res.returncode == 0
+        except Exception:
+            ok = False
+        if self.tray is not None:
+            self.tray.showMessage("Виджеты", "Ярлык «Виджеты» создан на рабочем столе - запускай через него."
+                                  if ok else "Не получилось создать ярлык.",
+                                  QSystemTrayIcon.MessageIcon.Information, 5000)
+
     def restart(self):
         """Запустить программу заново - новая копия дождётся, пока эта закроется."""
-        args = [sys.executable] + ([] if FROZEN else [os.path.abspath(__file__)]) + ["--restart"]
+        args = ([sys.executable] if FROZEN else [pythonw_exe(), os.path.abspath(__file__)]) + ["--restart"]
         try:
-            exe = args[0]
-            if IS_WIN and not FROZEN:
-                pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-                if os.path.exists(pw):
-                    args[0] = pw
             subprocess.Popen(args, creationflags=NO_WINDOW if IS_WIN else 0)
         except Exception:
             log_error("перезапуск")

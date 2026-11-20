@@ -26,12 +26,18 @@ jobs:
         run: python make_icon.py
       - name: Build exe
         run: python -m PyInstaller --noconsole --onefile --name SnowDesktop --icon snow.ico snow.pyw
+      - name: Build widgets exe
+        run: python -m PyInstaller --noconsole --onefile --name SnowWidgets --icon snow.ico widgets.pyw
       - name: Rename
-        run: Copy-Item dist\SnowDesktop.exe SnowDesktop-windows.exe
+        run: |
+          Copy-Item dist\SnowDesktop.exe SnowDesktop-windows.exe
+          Copy-Item dist\SnowWidgets.exe SnowWidgets-windows.exe
       - uses: actions/upload-artifact@v4
         with:
           name: SnowDesktop-windows
-          path: SnowDesktop-windows.exe
+          path: |
+            SnowDesktop-windows.exe
+            SnowWidgets-windows.exe
 
   mac:
     runs-on: macos-latest
@@ -65,9 +71,12 @@ jobs:
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Сборка {0}', github.run_number) }}
           files: |
             SnowDesktop-windows.exe
+            SnowWidgets-windows.exe
             SnowDesktop-mac.zip
           body: |
             **Windows:** скачай `SnowDesktop-windows.exe` и запусти. Если Windows предупредит — «Подробнее» → «Выполнить в любом случае».
+
+            **Виджеты для Windows:** `SnowWidgets-windows.exe` - заряд мыши и Bluetooth-устройств, слайд-шоу фото, часы, система.
 
             **macOS (Apple Silicon):** скачай `SnowDesktop-mac.zip`, распакуй, перетащи `SnowDesktop.app` в «Программы».
             При первом запуске: «Системные настройки» → «Конфиденциальность и безопасность» → «Всё равно открыть».

@@ -33,7 +33,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -119,19 +119,52 @@ HOLIDAYS = {(1, 1): "Новый год", (1, 2): "Новогодние кани�
             (5, 1): "Праздник Весны и Труда", (5, 9): "День Победы", (6, 12): "День России",
             (11, 4): "День народного единства"}
 
-THEMES = {
-    "dark": {"bg1": QColor(44, 46, 52, 238), "bg2": QColor(28, 29, 33, 238),
-             "fg": QColor(245, 245, 247), "fg2": QColor(160, 162, 170),
-             "track": QColor(255, 255, 255, 38), "line": QColor(255, 255, 255, 26),
-             "btn": QColor(255, 255, 255, 30)},
-    "light": {"bg1": QColor(252, 252, 253, 242), "bg2": QColor(236, 237, 241, 242),
-              "fg": QColor(28, 28, 30), "fg2": QColor(120, 120, 128),
-              "track": QColor(0, 0, 0, 30), "line": QColor(0, 0, 0, 22),
-              "btn": QColor(0, 0, 0, 18)},
-}
 GREEN, YELLOW, RED, BLUE = QColor("#30D158"), QColor("#FFD60A"), QColor("#FF453A"), QColor("#0A84FF")
 ACCENT = QColor("#FF9F0A")
 WHITE = QColor(255, 255, 255)
+
+
+def _style(name, mode="grad", **kw):
+    st = {"name": name, "mode": mode, "light": False, "mono": False,
+          "bg1": QColor(44, 46, 52, 238), "bg2": QColor(28, 29, 33, 238),
+          "fg": QColor(245, 245, 247), "fg2": QColor(160, 162, 170),
+          "track": QColor(255, 255, 255, 38), "line": QColor(255, 255, 255, 26), "btn": QColor(255, 255, 255, 30),
+          "accent": ACCENT, "weekend": QColor(255, 105, 97), "today_bg": RED, "today_fg": WHITE,
+          "pill": QColor(255, 69, 58, 210), "face": WHITE, "ink": QColor(20, 20, 22), "hand": ACCENT}
+    st.update(kw)
+    return st
+
+
+DARK_INK = QColor(245, 245, 247)
+STYLES = {
+    "dark": _style("Тёмный"),
+    "light": _style("Светлый", light=True, bg1=QColor(252, 252, 253, 242), bg2=QColor(236, 237, 241, 242),
+                    fg=QColor(28, 28, 30), fg2=QColor(120, 120, 128), track=QColor(0, 0, 0, 30),
+                    line=QColor(0, 0, 0, 22), btn=QColor(0, 0, 0, 18), face=QColor(30, 30, 32), ink=DARK_INK),
+    "glass": _style("Стекло", "glass", tint=QColor(16, 18, 26, 105), fg=WHITE, fg2=QColor(255, 255, 255, 185),
+                    track=QColor(255, 255, 255, 50), line=QColor(255, 255, 255, 70), btn=QColor(255, 255, 255, 45)),
+    "frost": _style("Матовое стекло", "glass", light=True, tint=QColor(255, 255, 255, 160),
+                    fg=QColor(18, 18, 22), fg2=QColor(50, 50, 62, 200), track=QColor(0, 0, 0, 35),
+                    line=QColor(255, 255, 255, 150), btn=QColor(0, 0, 0, 22), face=QColor(30, 30, 32), ink=DARK_INK),
+    "neon": _style("Неон", "neon", bg1=QColor(18, 14, 34, 242), bg2=QColor(7, 7, 16, 242),
+                   fg=QColor(240, 240, 255), fg2=QColor(150, 150, 195), track=QColor(255, 255, 255, 24),
+                   line=QColor(0, 0, 0, 0), btn=QColor(255, 255, 255, 26), accent=QColor("#00E5FF"),
+                   weekend=QColor("#FF4FD8"), today_bg=QColor("#FF2D95"), pill=QColor("#FF2D95"),
+                   face=QColor(16, 14, 30), ink=QColor("#E6E6FF"), hand=QColor("#00E5FF"),
+                   glow1=QColor("#00E5FF"), glow2=QColor("#FF2D95")),
+    "color": _style("Яркий", "color", mono=True, fg=WHITE, fg2=QColor(255, 255, 255, 205),
+                    track=QColor(255, 255, 255, 64), line=QColor(255, 255, 255, 45), btn=QColor(255, 255, 255, 50),
+                    accent=WHITE, weekend=QColor(255, 255, 255, 235), today_bg=WHITE, today_fg=None,
+                    pill=QColor(255, 255, 255, 80)),
+    "winter": _style("Зимний", "winter", bg1=QColor(40, 76, 126, 242), bg2=QColor(15, 30, 60, 242),
+                     fg=QColor(240, 247, 255), fg2=QColor(172, 198, 228), track=QColor(255, 255, 255, 42),
+                     line=QColor(255, 255, 255, 40), btn=QColor(255, 255, 255, 36), accent=QColor("#8FD3FF"),
+                     weekend=QColor("#FF9A9A"), hand=QColor("#E04848")),
+}
+KIND_COLORS = {"battery": ("#2BC48A", "#0B8C8F"), "calendar": ("#FF6A5C", "#F29A3E"),
+               "clock": ("#5B5BD6", "#A35BE0"), "system": ("#2D7FF9", "#2EC0EE"),
+               "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9")}
+OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
 
 
 def font(px, weight=NORMAL):
@@ -957,6 +990,99 @@ def text(p, rc, s, f, color, align=AC, elide=True):
 
 
 # ---------------------------------------------------------------------------
+#  Размытые обои рабочего стола - фон для стиля "Стекло" (как в macOS)
+# ---------------------------------------------------------------------------
+class Wallpaper:
+    """Виджеты лежат прямо на рабочем столе, поэтому "стекло" - это размытый кусок обоев под виджетом."""
+
+    def __init__(self):
+        self.key = None
+        self.cache = {}
+
+    @staticmethod
+    def info():
+        """(путь к картинке или None, способ размещения, цвет фона)."""
+        path, style, color = os.environ.get("SNOWWIDGETS_WALLPAPER"), "fill", QColor(30, 50, 80)
+        if IS_WIN:
+            try:
+                buf = ctypes.create_unicode_buffer(520)
+                if ctypes.windll.user32.SystemParametersInfoW(0x0073, 520, buf, 0) and buf.value:
+                    path = buf.value
+                if not path or not os.path.isfile(path):
+                    tw = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Themes",
+                                      "TranscodedWallpaper")
+                    path = tw if os.path.isfile(tw) else None
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as k:
+                    ws = str(winreg.QueryValueEx(k, "WallpaperStyle")[0])
+                    try:
+                        tile = str(winreg.QueryValueEx(k, "TileWallpaper")[0])
+                    except OSError:
+                        tile = "0"
+                style = {"2": "stretch", "6": "fit", "0": "tile" if tile == "1" else "center"}.get(ws, "fill")
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Colors") as k:
+                    rgb = [int(x) for x in str(winreg.QueryValueEx(k, "Background")[0]).split()]
+                    color = QColor(*rgb[:3])
+            except Exception:
+                pass
+        return path, style, color
+
+    def check(self):
+        """True, если обои поменялись."""
+        path, style, color = self.info()
+        try:
+            mt = os.path.getmtime(path) if path else 0
+        except Exception:
+            mt = 0
+        key = (path, mt, style, color.name())
+        if key != self.key:
+            self.key = key
+            self.cache.clear()
+            return True
+        return False
+
+    def blurred(self, w, h):
+        k = (w, h)
+        if k not in self.cache:
+            if self.key is None:
+                self.check()
+            path, _mt, style, color = self.key
+            cw, ch = max(8, w // 4), max(8, h // 4)
+            canvas = QImage(cw, ch, QImage.Format.Format_RGB32)
+            canvas.fill(QColor(color))
+            src = QImage(path) if path else QImage()
+            if not src.isNull():
+                p = QPainter(canvas)
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                iw, ih = src.width(), src.height()
+                if style == "stretch":
+                    p.drawImage(QRectF(0, 0, cw, ch), src)
+                elif style in ("center", "tile"):
+                    s4 = 0.25
+                    p.drawImage(QRectF((cw - iw * s4) / 2, (ch - ih * s4) / 2, iw * s4, ih * s4), src)
+                else:
+                    sc = (max if style == "fill" else min)(cw / iw, ch / ih)
+                    p.drawImage(QRectF((cw - iw * sc) / 2, (ch - ih * sc) / 2, iw * sc, ih * sc), src)
+                p.end()
+            smooth_t = Qt.TransformationMode.SmoothTransformation
+            ign = Qt.AspectRatioMode.IgnoreAspectRatio
+            img = canvas
+            for div in (10, 5):                      # размытие: уменьшить и снова растянуть (два прохода)
+                small = img.scaled(max(2, cw // div), max(2, ch // div), ign, smooth_t)
+                img = small.scaled(cw, ch, ign, smooth_t)
+            self.cache[k] = img
+        return self.cache[k]
+
+    def draw(self, p, r, widget):
+        scr = widget.screen() or QApplication.primaryScreen()
+        g = scr.geometry()
+        img = self.blurred(g.width(), g.height())
+        tl = widget.mapToGlobal(r.topLeft().toPoint())
+        sx, sy = img.width() / g.width(), img.height() / g.height()
+        p.drawImage(r, img, QRectF((tl.x() - g.x()) * sx, (tl.y() - g.y()) * sy, r.width() * sx, r.height() * sy))
+
+
+# ---------------------------------------------------------------------------
 #  Базовый виджет: окно без рамки, скруглённая карточка, анимации, перетаскивание, меню
 # ---------------------------------------------------------------------------
 SIZES = {"s": (170, 170), "m": (360, 170), "l": (360, 376), "xl": (552, 376)}
@@ -1001,7 +1127,28 @@ class Card(QWidget):
     # ----- окно -----
     @property
     def theme(self):
-        return THEMES[self.mgr.cfg.get("theme", "dark")]
+        return STYLES[self.mgr.style_name(self.cfg)]
+
+    def opacity(self):
+        v = self.cfg.get("opacity")
+        return float(self.mgr.cfg.get("opacity", 1.0) if v is None else v)
+
+    def kind_colors(self):
+        return KIND_COLORS.get(self.KIND, ("#3A3A44", "#1E1E26"))
+
+    def ring_col(self, col, low=False):
+        """Цвет кольца/полосы: в стиле "Яркий" всё белое, кроме низкого заряда."""
+        if self.theme["mono"]:
+            return QColor("#FFE14D") if low else WHITE
+        return col
+
+    def today_fg(self, th):
+        return th["today_fg"] if th["today_fg"] is not None else QColor(self.kind_colors()[0])
+
+    def moveEvent(self, ev):
+        super().moveEvent(ev)
+        if self.theme["mode"] == "glass":
+            self.update()                  # под виджетом другой кусок обоев
 
     @property
     def animated(self):
@@ -1131,23 +1278,46 @@ class Card(QWidget):
         p.translate(c)
         p.scale(scale, scale)
         p.translate(-c)
+        op = self.opacity()
+        neon = th["mode"] == "neon"
         p.setPen(NOPEN)
-        for i in range(MARGIN, 0, -2):                       # мягкая тень
-            a = int(26 * (1 - i / MARGIN) ** 2) + 1
-            p.setBrush(QColor(0, 0, 0, a))
-            p.drawRoundedRect(r.adjusted(-i * 0.7, -i * 0.5, i * 0.7, i * 0.9), RADIUS + i * 0.6, RADIUS + i * 0.6)
+        for i in range(MARGIN, 0, -2):                       # мягкая тень (у неона - цветное свечение)
+            k = (1 - i / MARGIN) ** 2
+            if neon:
+                g = QLinearGradient(r.topLeft(), r.bottomRight())
+                c1, c2 = QColor(th["glow1"]), QColor(th["glow2"])
+                c1.setAlpha(int(70 * k * op) + 1)
+                c2.setAlpha(int(70 * k * op) + 1)
+                g.setColorAt(0, c1)
+                g.setColorAt(1, c2)
+                p.setBrush(g)
+                p.drawRoundedRect(r.adjusted(-i * 0.8, -i * 0.8, i * 0.8, i * 0.8), RADIUS + i * 0.7, RADIUS + i * 0.7)
+            else:
+                p.setBrush(QColor(0, 0, 0, int(26 * k * (0.3 + 0.7 * op)) + 1))
+                p.drawRoundedRect(r.adjusted(-i * 0.7, -i * 0.5, i * 0.7, i * 0.9), RADIUS + i * 0.6, RADIUS + i * 0.6)
         path = QPainterPath()
         path.addRoundedRect(r, RADIUS, RADIUS)
-        self.paint_bg(p, path, r, th)
         p.save()
         p.setClipPath(path)
+        p.save()
+        p.setOpacity(p.opacity() * op)
+        self.paint_bg(p, path, r, th)
+        p.restore()
         try:
             self.paint(p, r, th)
+            if th["mode"] == "winter":
+                self.paint_snowcap(p, r)
         except Exception:
             traceback.print_exc()
         p.restore()
-        p.setPen(QPen(th["line"], 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
+        if neon:
+            g = QLinearGradient(r.topLeft(), r.bottomRight())
+            g.setColorAt(0, th["glow1"])
+            g.setColorAt(1, th["glow2"])
+            p.setPen(QPen(g, 1.6))
+        else:
+            p.setPen(QPen(th["line"], 1))
         p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), RADIUS, RADIUS)
         p.end()
         self._schedule()
@@ -1157,10 +1327,78 @@ class Card(QWidget):
             self._ft.start(self._frame_ms)
 
     def paint_bg(self, p, path, r, th):
+        mode = th["mode"]
+        if mode == "glass":
+            self.mgr.wall.draw(p, r, self)
+            p.fillPath(path, th["tint"])
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())           # блик сверху
+            g.setColorAt(0, QColor(255, 255, 255, 40))
+            g.setColorAt(0.45, QColor(255, 255, 255, 0))
+            p.fillPath(path, g)
+            return
+        if mode == "color":
+            c1, c2 = self.kind_colors()
+            g = QLinearGradient(r.topLeft(), r.bottomRight())
+            g.setColorAt(0, QColor(c1))
+            g.setColorAt(1, QColor(c2))
+            p.fillPath(path, g)
+            return
         g = QLinearGradient(r.topLeft(), r.bottomLeft())
         g.setColorAt(0, th["bg1"])
         g.setColorAt(1, th["bg2"])
         p.fillPath(path, g)
+        if mode == "winter":
+            self.paint_flakes(p, r)
+
+    def _rng(self):
+        return random.Random(str(self.cfg.get("id", self.KIND)))
+
+    def paint_flakes(self, p, r):
+        """Едва заметные снежинки на фоне зимнего стиля."""
+        rnd = self._rng()
+        pen = QPen(QColor(255, 255, 255, 28), 1.1)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for _ in range(int(r.width() * r.height() / 2600)):
+            x, y, s = r.x() + rnd.random() * r.width(), r.y() + rnd.random() * r.height(), rnd.uniform(3, 8)
+            for k in range(3):
+                a = math.radians(k * 60 + rnd.random() * 0)
+                dx, dy = math.cos(a) * s, math.sin(a) * s
+                p.drawLine(QPointF(x - dx, y - dy), QPointF(x + dx, y + dy))
+
+    def paint_snowcap(self, p, r):
+        """Шапка снега на верхнем крае виджета (стиль "Зимний")."""
+        rnd = self._rng()
+        path = QPainterPath()
+        path.moveTo(r.left(), r.top())
+        x = r.left()
+        while x < r.right():
+            step = rnd.uniform(16, 30)
+            nx = min(r.right(), x + step)
+            path.quadTo(QPointF((x + nx) / 2, r.top() + rnd.uniform(6, 11)), QPointF(nx, r.top() + rnd.uniform(2.5, 5)))
+            x = nx
+        path.lineTo(r.right(), r.top())
+        path.closeSubpath()
+        p.save()
+        p.setPen(NOPEN)
+        p.setBrush(QColor(120, 170, 220, 70))
+        p.translate(0, 1.6)
+        p.drawPath(path)
+        p.translate(0, -1.6)
+        g = QLinearGradient(0, r.top(), 0, r.top() + 10)
+        g.setColorAt(0, QColor(255, 255, 255, 250))
+        g.setColorAt(1, QColor(225, 238, 252, 245))
+        p.setBrush(g)
+        p.drawPath(path)
+        p.setBrush(QColor(255, 255, 255, 235))               # капельки-сосульки
+        for _ in range(int(r.width() / 70)):
+            cx = r.left() + RADIUS + rnd.random() * (r.width() - 2 * RADIUS)
+            ln = rnd.uniform(4, 9)
+            drop = QPainterPath()
+            drop.moveTo(cx - 2.2, r.top() + 4)
+            drop.quadTo(QPointF(cx, r.top() + 4 + ln * 1.4), QPointF(cx + 2.2, r.top() + 4))
+            p.drawPath(drop)
+        p.restore()
 
     def paint(self, p, r, th):
         pass
@@ -1247,6 +1485,18 @@ class Card(QWidget):
             a.setChecked(self.cfg["size"] == s)
             grp.addAction(a)
             a.triggered.connect(lambda _=False, s=s: self.set_size(s))
+        if self.KIND != "weather":
+            dm = menu.addMenu("Дизайн этого виджета")
+            grp2 = QActionGroup(dm)
+            for key, label in [(None, "Как у всех (%s)" % STYLES[self.mgr.style_name({})]["name"])] + \
+                    [(k, v["name"]) for k, v in STYLES.items()]:
+                a = dm.addAction(label)
+                a.setCheckable(True)
+                a.setChecked(self.cfg.get("style") == key)
+                grp2.addAction(a)
+                a.triggered.connect(lambda _=False, k=key: self.set_opt("style", k))
+        om = menu.addMenu("Прозрачность этого виджета")
+        self.mgr.opacity_menu(om, self.cfg.get("opacity"), lambda v: self.set_opt("opacity", v), allow_none=True)
         a = menu.addAction("Поверх всех окон")
         a.setCheckable(True)
         a.setChecked(bool(self.cfg.get("on_top")))
@@ -1259,6 +1509,14 @@ class Card(QWidget):
 
     def extra_menu(self, menu):
         pass
+
+    def set_opt(self, key, val):
+        if val is None:
+            self.cfg.pop(key, None)
+        else:
+            self.cfg[key] = val
+        self.mgr.save()
+        self.update()
 
     def set_on_top(self, on):
         self.cfg["on_top"] = bool(on)
@@ -1310,25 +1568,25 @@ class CalendarMixin:
         ch = grid.height() / 7
         for i, wd in enumerate(WD_SHORT):
             text(p, QRectF(grid.x() + i * cw, grid.y(), cw, ch), wd, font(fs * 0.85, SEMI),
-                 th["fg2"] if i < 5 else QColor(255, 69, 58, 170))
+                 th["fg2"] if i < 5 else th["weekend"])
         for wi, week in enumerate(weeks):
             for i, day in enumerate(week):
                 if not day:
                     continue
                 cell = QRectF(grid.x() + i * cw, grid.y() + (wi + 1) * ch, cw, ch)
                 hol = (month, day) in HOLIDAYS
-                col = th["fg"] if i < 5 and not hol else QColor(255, 105, 97)
+                col = th["fg"] if i < 5 and not hol else th["weekend"]
                 is_today = (year, month, day) == (today.year, today.month, today.day)
                 if is_today:
                     d = min(cw, ch) * 0.9
                     p.setPen(NOPEN)
-                    p.setBrush(RED)
+                    p.setBrush(th["today_bg"])
                     p.drawEllipse(cell.center(), d / 2, d / 2)
-                    col = WHITE
+                    col = self.today_fg(th)
                 text(p, cell, str(day), font(fs, SEMI if (is_today or hol) else NORMAL), col)
                 if hol and not is_today:
                     p.setPen(NOPEN)
-                    p.setBrush(QColor(255, 105, 97, 200))
+                    p.setBrush(th["weekend"])
                     p.drawEllipse(QPointF(cell.center().x(), cell.bottom() - ch * 0.1), 1.6, 1.6)
 
     def paint_calendar(self, p, rc, th, fs, big=False):
@@ -1341,7 +1599,7 @@ class CalendarMixin:
             title += " " + str(y)
         tf = font(fs * (1.25 if big else 1.0), SEMI)
         trc = QRectF(rc.x(), rc.y(), rc.width() - 2 * bs - 6, hh)
-        text(p, trc, title, tf, th["fg"] if big else ACCENT, AL | AVC)
+        text(p, trc, title, tf, th["fg"] if big else th["accent"], AL | AVC)
         p.setFont(tf)
         title_w = p.fontMetrics().horizontalAdvance(title)
         self.hit(QRectF(trc.x(), trc.y(), min(trc.width(), title_w + 6), hh), self.cal_today)
@@ -1361,7 +1619,7 @@ class CalendarMixin:
             pill = QRectF(rc.right() - 2 * bs - 10 - pw, rc.y() + hh * 0.15, pw, hh * 0.7)
             if pill.left() > rc.x() + title_w + 8:
                 p.setPen(NOPEN)
-                p.setBrush(QColor(255, 69, 58, 210))
+                p.setBrush(th["pill"])
                 p.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
                 text(p, pill, "Сегодня", pf, WHITE)
                 self.hit(pill, self.cal_today)
@@ -1444,11 +1702,12 @@ class CalendarCard(CalendarMixin, Card):
             lines = "через %d %s — %d %s" % (days, plural(days, "день", "дня", "дней"), nh[0].day,
                                              MONTHS_GEN[nh[0].month - 1])
         text(p, QRectF(r.x() + 18, r.bottom() - 62, r.width() - 36, 20), title, font(12, SEMI),
-             QColor(255, 105, 97), AL | AVC)
+             th["weekend"], AL | AVC)
         text(p, QRectF(r.x() + 18, r.bottom() - 42, r.width() - 36, 20), lines, font(12), th["fg2"], AL | AVC)
 
     def _today_block(self, p, rc, today, th, big):
-        text(p, QRectF(rc.x(), rc.y(), rc.width(), 18), WEEKDAYS[today.weekday()].upper(), font(12, SEMI), RED, AL)
+        text(p, QRectF(rc.x(), rc.y(), rc.width(), 18), WEEKDAYS[today.weekday()].upper(), font(12, SEMI),
+             th["weekend"] if th["mode"] not in ("grad",) or th["light"] else RED, AL)
         text(p, QRectF(rc.x(), rc.y() + 12, rc.width(), big * 1.3), str(today.day), font(big, LIGHT), th["fg"], AL)
         text(p, QRectF(rc.x(), rc.y() + 14 + big * 1.22, rc.width(), 18),
              "%s %d" % (MONTHS_GEN[today.month - 1], today.year), font(13), th["fg2"], AL)
@@ -1538,18 +1797,19 @@ class BatteryCard(Card):
                 text(p, QRectF(r.x() + 70, y + 6, r.width() - 150, 20), d["name"], font(13), th["fg"], AL | AVC)
                 text(p, QRectF(r.right() - 80, y + 6, 60, 20), "%d%%" % round(v), font(14, SEMI), th["fg"], AR | AVC)
                 draw_bar(p, QRectF(r.x() + 70, y + 31, r.width() - 90, 7), v / 100.0,
-                         level_color(d["level"]), th["track"])
+                         self.ring_col(level_color(d["level"]), d["level"] <= 15), th["track"])
                 if d.get("charging"):
-                    draw_bolt(p, r.right() - 96, y + 16, 14, GREEN)
+                    draw_bolt(p, r.right() - 96, y + 16, 14, self.ring_col(GREEN))
 
     def _ring(self, p, d, v, cx, cy, rad, width, th, icon):
-        draw_ring(p, cx, cy, rad, width, v / 100.0, level_color(d["level"]), th["track"])
+        draw_ring(p, cx, cy, rad, width, v / 100.0, self.ring_col(level_color(d["level"]), d["level"] <= 15),
+                  th["track"])
         draw_icon(p, d["kind"], cx, cy, icon, th["fg"])
         if d.get("charging"):
             p.setPen(NOPEN)
-            p.setBrush(self.theme["bg2"])
+            p.setBrush(QColor(self.kind_colors()[1]) if th["mode"] == "color" else th["bg2"])
             p.drawEllipse(QPointF(cx + rad * 0.72, cy - rad * 0.72), rad * 0.28, rad * 0.28)
-            draw_bolt(p, cx + rad * 0.72, cy - rad * 0.72, rad * 0.4, GREEN)
+            draw_bolt(p, cx + rad * 0.72, cy - rad * 0.72, rad * 0.4, self.ring_col(GREEN))
 
     def extra_menu(self, menu):
         menu.addAction("Обновить сейчас").triggered.connect(self.mgr.battery.refresh)
@@ -1701,7 +1961,7 @@ class PhotoCard(Card):
         cfg.setdefault("recursive", True)
         cfg.setdefault("caption", True)
         cfg.setdefault("kenburns", True)
-        self.files, self.order, self.pos = None, [], -1      # files=None - ещё не искали
+        self.files, self.order, self.idx = None, [], -1      # files=None - ещё не искали
         self.cur = self.prev = None           # Shot
         self.fade_t0 = 0.0
         self.token = 0
@@ -1744,7 +2004,7 @@ class PhotoCard(Card):
         if key != self.source_key():
             return
         first = not self.files
-        cur = self.order[self.pos] if 0 <= self.pos < len(self.order) else None
+        cur = self.order[self.idx] if 0 <= self.idx < len(self.order) else None
         self.files = files
         self._reorder(keep=cur)
         self.update()
@@ -1756,7 +2016,7 @@ class PhotoCard(Card):
         self.order = list(self.files or [])
         if self.cfg.get("shuffle"):
             random.shuffle(self.order)
-        self.pos = self.order.index(keep) if keep in self.order else -1
+        self.idx = self.order.index(keep) if keep in self.order else -1
 
     def _restart_timer(self):
         self.timer.start(int(self.cfg.get("interval", 10)) * 1000)
@@ -1764,13 +2024,13 @@ class PhotoCard(Card):
     def next(self, step=1):
         if not self.order or self.loading:
             return
-        self.pos = (self.pos + step) % len(self.order)
-        if self.pos == 0 and step > 0 and self.cfg.get("shuffle") and len(self.order) > 2:
+        self.idx = (self.idx + step) % len(self.order)
+        if self.idx == 0 and step > 0 and self.cfg.get("shuffle") and len(self.order) > 2:
             last = self.order[-1]
             random.shuffle(self.order)
             if self.order[0] == last:
                 self.order.append(self.order.pop(0))
-        self._load(self.order[self.pos])
+        self._load(self.order[self.idx])
 
     def _load(self, path, instant=False):
         self.token += 1
@@ -1801,7 +2061,7 @@ class PhotoCard(Card):
             if path in self.order and len(self.order) > 1:
                 i = self.order.index(path)
                 self.order.pop(i)
-                self.pos = i - 1
+                self.idx = i - 1
                 QTimer.singleShot(30, self.next)
             elif self.cur is None:
                 self.files = []
@@ -1826,6 +2086,8 @@ class PhotoCard(Card):
             return
         moving = bool(self.cfg.get("kenburns")) and self.animated
         period = int(self.cfg.get("interval", 10)) + self.FADE * 2
+        p.save()
+        p.setOpacity(p.opacity() * self.opacity())
         t = 1.0
         if self.prev is not None:
             t = smooth((time.time() - self.fade_t0) / self.FADE)
@@ -1834,7 +2096,6 @@ class PhotoCard(Card):
             else:
                 self.prev.draw(p, r, period, moving)
                 self.want_frame(16)
-        p.save()
         p.setOpacity(p.opacity() * t)
         self.cur.draw(p, r, period, moving)
         p.restore()
@@ -1913,7 +2174,7 @@ class PhotoCard(Card):
         self._reset_source()
 
     def _reset_source(self):
-        self.files, self.order, self.pos = None, [], -1
+        self.files, self.order, self.idx = None, [], -1
         self.cur = self.prev = None
         self.mgr.save()
         self.update()
@@ -2262,7 +2523,7 @@ class ClockCard(CalendarMixin, Card):
             text(p, QRectF(tx, r.y() + 30, r.right() - tx - 16, 48), now.strftime("%H:%M"),
                  font(40, SEMI), th["fg"], AL | AVC)
             text(p, QRectF(tx, r.y() + 82, r.right() - tx - 16, 20), WEEKDAYS[now.weekday()],
-                 font(14, SEMI), ACCENT, AL | AVC)
+                 font(14, SEMI), th["accent"], AL | AVC)
             text(p, QRectF(tx, r.y() + 102, r.right() - tx - 16, 20),
                  "%d %s %d" % (now.day, MONTHS_GEN[now.month - 1], now.year), font(13), th["fg2"], AL | AVC)
         else:
@@ -2271,7 +2532,7 @@ class ClockCard(CalendarMixin, Card):
             text(p, QRectF(tx, r.y() + 36, r.right() - tx - 18, 46), now.strftime("%H:%M"),
                  font(38, SEMI), th["fg"], AL)
             text(p, QRectF(tx, r.y() + 86, r.right() - tx - 18, 20), WEEKDAYS[now.weekday()],
-                 font(14, SEMI), ACCENT, AL)
+                 font(14, SEMI), th["accent"], AL)
             text(p, QRectF(tx, r.y() + 106, r.right() - tx - 18, 20),
                  "%d %s %d" % (now.day, MONTHS_GEN[now.month - 1], now.year), font(13), th["fg2"], AL)
             p.setPen(QPen(th["line"], 1))
@@ -2280,11 +2541,14 @@ class ClockCard(CalendarMixin, Card):
 
     def _analog(self, p, cx, cy, rad, now, th):
         p.save()
-        light = self.mgr.cfg.get("theme") == "light"
         p.setPen(NOPEN)
-        p.setBrush(WHITE if not light else QColor(30, 30, 32))
+        p.setBrush(th["face"])
         p.drawEllipse(QPointF(cx, cy), rad, rad)
-        ink = QColor(20, 20, 22) if not light else QColor(245, 245, 247)
+        if th["mode"] == "neon":
+            p.setPen(QPen(th["glow1"], 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), rad - 0.7, rad - 0.7)
+        ink = th["ink"]
         p.setFont(font(rad * 0.22, SEMI))
         p.setPen(ink)
         for h in range(1, 13):
@@ -2311,9 +2575,9 @@ class ClockCard(CalendarMixin, Card):
 
         hand(hrs * 30, 0.5, rad * 0.075, ink)
         hand(mins * 6, 0.78, rad * 0.055, ink)
-        hand(sec * 6, 0.86, max(1.2, rad * 0.022), ACCENT, tail=0.16)
+        hand(sec * 6, 0.86, max(1.2, rad * 0.022), th["hand"], tail=0.16)
         p.setPen(NOPEN)
-        p.setBrush(ACCENT)
+        p.setBrush(th["hand"])
         p.drawEllipse(QPointF(cx, cy), rad * 0.055, rad * 0.055)
         p.restore()
         if self.animated:
@@ -2339,11 +2603,14 @@ class SystemCard(Card):
 
     def items(self):
         s = self.mgr.system
-        return [("ЦП", self.av("cpu", s.cpu, 4.0, 0.0), "%d%%" % s.cpu, BLUE),
-                ("ОЗУ", self.av("mem", s.mem[0], 4.0, 0.0), "%s/%s ГБ" % (gb(s.mem[1]), gb(s.mem[2])),
-                 QColor("#BF5AF2")),
+        neon = self.theme["mode"] == "neon"
+        cols = (QColor("#00E5FF"), QColor("#FF2D95"), QColor("#B4FF39")) if neon else \
+               (BLUE, QColor("#BF5AF2"), QColor("#FF9F0A"))
+        cols = [self.ring_col(c) for c in cols]
+        return [("ЦП", self.av("cpu", s.cpu, 4.0, 0.0), "%d%%" % s.cpu, cols[0]),
+                ("ОЗУ", self.av("mem", s.mem[0], 4.0, 0.0), "%s/%s ГБ" % (gb(s.mem[1]), gb(s.mem[2])), cols[1]),
                 ("Диск " + s.disk_name.rstrip("\\"), self.av("disk", s.disk[0], 4.0, 0.0),
-                 "своб. %s ГБ" % gb(s.disk[2] - s.disk[1]), QColor("#FF9F0A"))]
+                 "своб. %s ГБ" % gb(s.disk[2] - s.disk[1]), cols[2])]
 
     def paint(self, p, r, th):
         items = self.items()
@@ -2379,11 +2646,12 @@ class SystemCard(Card):
                 fill = QPainterPath(path)
                 fill.lineTo(pts[-1].x(), gr.bottom())
                 fill.lineTo(pts[0].x(), gr.bottom())
+                lc = items[0][3]
                 g = QLinearGradient(0, gr.y(), 0, gr.bottom())
-                g.setColorAt(0, QColor(10, 132, 255, 110))
-                g.setColorAt(1, QColor(10, 132, 255, 0))
+                g.setColorAt(0, QColor(lc.red(), lc.green(), lc.blue(), 110))
+                g.setColorAt(1, QColor(lc.red(), lc.green(), lc.blue(), 0))
                 p.fillPath(fill, g)
-                p.setPen(QPen(BLUE, 2))
+                p.setPen(QPen(lc, 2))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawPath(path)
             for i, (name, val, det, col) in enumerate(items):
@@ -2492,6 +2760,8 @@ class Manager(QObject):
         self.desktop_shown = False
         self.low_alerted = set()
         self.cfg = self.load()
+        self.wall = Wallpaper()
+        self.wall.check()
         self.battery = BatteryService()
         self.system = SystemService()
         self.battery.updated.connect(self.check_low)
@@ -2507,6 +2777,9 @@ class Manager(QObject):
                 card.appear(0.15 + i * 0.09)            # виджеты появляются по очереди
         if first:
             self.save()
+        self.wall_timer = QTimer(self)                # сменились обои - обновить "стекло"
+        self.wall_timer.timeout.connect(self.check_wallpaper)
+        self.wall_timer.start(20 * 1000)
         if IS_WIN:                                # показ рабочего стола (Win+D, "Свернуть всё")
             self.desk_timer = QTimer(self)
             self.desk_timer.timeout.connect(self.watch_desktop)
@@ -2518,14 +2791,25 @@ class Manager(QObject):
             with open(CONFIG_FILE, encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, dict):
-                data.setdefault("theme", "dark")
+                if "style" not in data:                          # старые настройки: theme dark/light
+                    data["style"] = "light" if data.get("theme") == "light" else "dark"
+                data.pop("theme", None)
+                if data["style"] not in STYLES:
+                    data["style"] = "dark"
                 data.setdefault("widgets", [])
-                if data["theme"] not in THEMES:
-                    data["theme"] = "dark"
                 return data
         except Exception:
             pass
-        return {"theme": "dark", "locked": False, "animations": True, "widgets": []}
+        return {"style": "dark", "opacity": 1.0, "locked": False, "animations": True, "widgets": []}
+
+    def style_name(self, wcfg):
+        name = wcfg.get("style") or self.cfg.get("style") or "dark"
+        return name if name in STYLES else "dark"
+
+    def check_wallpaper(self):
+        if self.wall.check():
+            for c in self.cards:
+                c.update()
 
     def save(self):
         self._save_timer.start(500)
@@ -2540,16 +2824,24 @@ class Manager(QObject):
             pass
 
     def default_layout(self):
+        """Колонками справа налево; если колонка не помещается по высоте - начинаем следующую."""
         a = QApplication.primaryScreen().availableGeometry()
-        x_m = a.right() - 24 - MARGIN - SIZES["m"][0] + 1
-        y = a.top() + 24 - MARGIN
+        right = a.right() - 24
+        y = a.top() + 24
+        col_w = 0
         out = []
         for kind, size in (("weather", "m"), ("battery", "m"), ("photos", "l")):
-            wc = {"id": "%s-%d" % (kind, len(out)), "kind": kind, "size": size, "x": x_m, "y": y}
+            w, h = SIZES[size]
+            if out and y + h > a.bottom() - 16:
+                right -= col_w + 16
+                y, col_w = a.top() + 24, 0
+            wc = {"id": "%s-%d" % (kind, len(out)), "kind": kind, "size": size,
+                  "x": right - w + 1 - MARGIN, "y": y - MARGIN}
             if kind == "photos":
                 wc["folder"] = self.auto_photo_folder()
             out.append(wc)
-            y += SIZES[size][1] + 16
+            y += h + 16
+            col_w = max(col_w, w)
         return out
 
     @staticmethod
@@ -2603,20 +2895,40 @@ class Manager(QObject):
 
         card.vanish(dead)
 
-    def set_theme(self, name):
-        self.cfg["theme"] = name
+    def set_opt(self, key, val):
+        self.cfg[key] = val
         for c in self.cards:
             c.update()
         self.save()
+
+    def set_style_all(self, name):
+        """Выбрать дизайн для всех виджетов (сбрасывает личный дизайн у каждого)."""
+        for c in self.cards:
+            c.cfg.pop("style", None)
+        self.set_opt("style", name)
+
+    def set_opacity_all(self, v):
+        for c in self.cards:
+            c.cfg.pop("opacity", None)
+        self.set_opt("opacity", v)
 
     def set_flag(self, key, on):
-        self.cfg[key] = bool(on)
-        for c in self.cards:
-            c.update()
-        self.save()
+        self.set_opt(key, bool(on))
+
+    @staticmethod
+    def opacity_menu(menu, cur, setter, allow_none=False):
+        grp = QActionGroup(menu)
+        items = ([(None, "Как у всех")] if allow_none else []) + \
+            [(v, "Нет (непрозрачный)" if v >= 1.0 else "%d%%" % round((1 - v) * 100)) for v in OPACITY_STEPS]
+        for v, label in items:
+            a = menu.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(cur == v if (cur is None or v is None) else abs(float(cur) - v) < 0.01)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, v=v: setter(v))
 
     def menu_css(self):
-        if self.cfg.get("theme") == "light":
+        if STYLES[self.style_name({})]["light"]:
             return ""
         return ("QMenu { background:#2a2b30; color:#f2f2f4; border:1px solid #3a3b42; padding:4px; }"
                 "QMenu::item { padding:5px 22px 5px 24px; border-radius:4px; }"
@@ -2627,15 +2939,16 @@ class Manager(QObject):
         add = menu.addMenu("Добавить виджет")
         for kind, cls in KINDS.items():
             add.addAction(cls.TITLE).triggered.connect(lambda _=False, k=kind: self.add(k))
-        th = menu.addMenu("Оформление")
+        th = menu.addMenu("Оформление всех виджетов")
         grp = QActionGroup(th)
-        for key, label in (("dark", "Тёмное"), ("light", "Светлое")):
-            a = th.addAction(label)
+        for key, st in STYLES.items():
+            a = th.addAction(st["name"])
             a.setCheckable(True)
-            a.setChecked(self.cfg.get("theme") == key)
+            a.setChecked(self.style_name({}) == key)
             grp.addAction(a)
-            a.triggered.connect(lambda _=False, k=key: self.set_theme(k))
+            a.triggered.connect(lambda _=False, k=key: self.set_style_all(k))
         th.addSeparator()
+        self.opacity_menu(th.addMenu("Прозрачность"), self.cfg.get("opacity", 1.0), self.set_opacity_all)
         a = th.addAction("Анимации")
         a.setCheckable(True)
         a.setChecked(bool(self.cfg.get("animations", True)))

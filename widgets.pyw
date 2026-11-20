@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -2882,6 +2882,8 @@ class MediaService(QObject):
         self._got.connect(self._on)
         self._demo_play = True
         self.gen = 0
+        self.reason = None
+        self.need_winrt = False
         self.last_payload = time.time()
         self.dead_since = None
         self.none_count = 0
@@ -2928,14 +2930,21 @@ class MediaService(QObject):
         if not IS_WIN:
             self._emit({"error": "Работает только в Windows"})
             return
+        try:
+            # Этот поток сам говорит Windows, что будет работать с WinRT (многопоточный режим).
+            # Без этого после перезапуска опроса Windows переставала отвечать - название трека не приходило.
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
         mods = _winrt_try()
-        if mods is None:
-            self._emit({"error": "Ставлю компонент для связи с плеером..."})
+        if mods is None and not _HID_STATE.get("winrt_tried"):
+            _HID_STATE["winrt_tried"] = True                 # ставим компонент один раз за запуск
+            self._emit({"error": "Ставлю компонент для связи с плеером..."}, gen)
             if pip_install(*_WINRT_PKGS):
                 mods = _winrt_try()
         if mods is None:
-            self._emit({"error": "Нет компонента winrt. Выполни: pip install " + " ".join(_WINRT_PKGS),
-                        "dead": True}, gen)
+            self.reason = "не установлен компонент winrt для связи с плеером"
+            self._emit({"error": "Нет компонента winrt для связи с плеером", "dead": True, "need_winrt": True}, gen)
             return
         import asyncio
         loop = asyncio.new_event_loop()
@@ -3051,9 +3060,17 @@ class MediaService(QObject):
                 self.session = s
                 if s is None:
                     self._log_sessions(mgr, "нет подходящего плеера")
+                    try:
+                        n = len(list(mgr.get_sessions() or []))
+                    except Exception:
+                        n = 0
+                    self.reason = ("Windows не видит ни одного плеера" if n == 0 else
+                                   "Яндекс Музыка не найдена среди плееров Windows")
                 if s is not None:
                     props = await asyncio.wait_for(s.try_get_media_properties_async(), 3)
                     title = (props.title or "").strip()
+                    self.reason = None if title else "%s не передаёт название трека" % app_title(
+                        s.source_app_user_model_id)
                     if title:
                         status = self._status(s)
                         tl = s.get_timeline_properties()
@@ -3091,6 +3108,7 @@ class MediaService(QObject):
             except Exception as ex:
                 fails += 1
                 self.log("опрос: %r" % (ex,))
+                self.reason = "ошибка связи с плеером: %s" % type(ex).__name__
                 st = "keep"                                 # временная ошибка - не стираем трек с экрана
             self._emit({"state": st}, gen)
             await asyncio.sleep(1.0)
@@ -3103,6 +3121,7 @@ class MediaService(QObject):
             self.error = payload["error"]
             if payload.get("dead"):
                 self.dead_since = time.time()
+            self.need_winrt = bool(payload.get("need_winrt"))
             self.updated.emit()
             return
         self.error = None
@@ -3287,7 +3306,9 @@ class MusicCard(Card):
         self.angle = 0.0
         self.level = 0.0
         self.bars = []
-        self.shape = []
+        rnd = random.Random("snow")
+        self.shape = [0.45 + 0.55 * (0.5 + 0.5 * math.sin(i * 0.37 + rnd.random() * 6)) * rnd.uniform(0.6, 1.0)
+                      for i in range(120)]
         self._changed()
 
     # ----- данные трека -----
@@ -3514,7 +3535,7 @@ class MusicCard(Card):
             x = rc.x() + i * rc.width() / n
             bar = QRectF(x, mid - h / 2, 3.0, h)
             p.setPen(NOPEN)
-            if (i + 0.5) / n <= frac:
+            if (i + 0.5) / n <= frac or (dur <= 0 and playing):     # длина неизвестна - вся волна "живая"
                 p.setBrush(played)
             else:
                 p.setBrush(QColor(255, 255, 255, 70))
@@ -3534,7 +3555,7 @@ class MusicCard(Card):
         text(p, QRectF(rc.right() - 60, rc.y(), 60, 14), "-" + fmt_time(dur - pos), font(10), soft, AR)
 
     def _controls(self, p, cx, cy, size, gap):
-        playing = bool((self.media.state or {}).get("playing"))
+        playing = bool(getattr(self, "_vis_playing", False))
         for name, dx, sc in (("prev", -gap, 0.7), ("toggle", 0, 1.0), ("next", gap, 0.7)):
             s = size * sc
             rc = QRectF(cx + dx - s * 0.75, cy - s * 0.75, s * 1.5, s * 1.5)
@@ -3584,9 +3605,21 @@ class MusicCard(Card):
                 self._sound_t = time.time()
             if time.time() - getattr(self, "_sound_t", 0) < 3.0:
                 # звук идёт, а название Windows не отдала - всё равно показываем живую пластинку
-                st = {"title": "Играет музыка", "artist": "название трека не пришло от плеера", "album": "",
+                why = self.media.reason or self.media.error or "название трека не пришло от плеера"
+                st = {"title": "Играет музыка", "artist": why, "album": "",
                       "app": "", "playing": True, "pos": 0.0, "dur": 0.0, "stamp": time.time(), "cover": None,
                       "key": None, "status": 4}
+        generic = bool(st) and st.get("key") is None and self.media.state is None
+        if generic:
+            r0 = self.card_rect()
+            self.hit(QRectF(r0.x(), r0.y(), r0.width(), r0.height() * 0.62), self.diagnose)
+            if self.media.need_winrt and not FROZEN:
+                pill = QRectF(r0.right() - 176, r0.y() + 8, 164, 24)
+                p.setPen(NOPEN)
+                p.setBrush(YA_YELLOW)
+                p.drawRoundedRect(pill, 12, 12)
+                text(p, pill, "Установить компонент", font(11, SEMI), QColor(20, 20, 20))
+                self.hit(pill, self.install_winrt)
         playing = bool(st and st.get("title") and st["playing"])
         # звук по громкости считаем "игрой", только если плеер не сказал прямо "пауза"/"стоп"
         slide = self._tick(playing, bool(st and st.get("title")) and (st or {}).get("status") not in (3, 5))
@@ -3649,6 +3682,28 @@ class MusicCard(Card):
         open_target("yandexmusic://", os.path.join(local, "Programs", "YandexMusic", "Яндекс Музыка.exe"),
                     "https://music.yandex.ru/")
 
+    def install_winrt(self):
+        """Поставить компонент связи с плеером в видимом окне консоли, потом перезапустить виджеты."""
+        exe = sys.executable
+        if exe.lower().endswith("pythonw.exe"):
+            exe = exe[:-5] + ".exe"
+        cmd = '"%s" -m pip install %s & echo. & echo Готово - виджеты перезапустятся. & timeout /t 3' % (
+            exe, " ".join(_WINRT_PKGS))
+        try:
+            proc = subprocess.Popen(["cmd", "/c", cmd], creationflags=0x00000010)      # CREATE_NEW_CONSOLE
+        except Exception:
+            log_error("установка winrt")
+            return
+        self._pip_timer = QTimer(self)
+
+        def check():
+            if proc.poll() is not None:               # окно установки закрылось - перезапускаемся
+                self._pip_timer.stop()
+                self.mgr.restart()
+
+        self._pip_timer.timeout.connect(check)
+        self._pip_timer.start(1000)
+
     def diagnose(self):
         st = self.media.state or {}
         peak = _METER.peak()
@@ -3663,6 +3718,7 @@ class MusicCard(Card):
                  "Пластинка крутится: %s" % ("да" if getattr(self, "_vis_playing", False) else "нет"),
                  "Режим пластинки: %s" % ("всегда" if self.cfg.get("spin") == "always" else "когда играет"),
                  "Ошибка связи с плеером: %s" % (self.media.error or "нет"),
+                 "Почему нет названия: %s" % (self.media.reason or "-"),
                  "", "Журналы: " + DATA_DIR]
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(QMessageBox.Icon.Information, "Музыка - диагностика", "\n".join(lines))

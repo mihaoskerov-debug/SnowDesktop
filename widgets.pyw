@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -3092,34 +3092,76 @@ YA_YELLOW = QColor("#FFD83D")
 YA_ORANGE = QColor("#FF8A3D")
 
 
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(text):
+    g = GUID()
+    ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p("{%s}" % text), ctypes.byref(g))
+    return g
+
+
+def _com(obj, index, argtypes, *args):
+    """Вызов метода COM-объекта по номеру в таблице методов (без сторонних библиотек)."""
+    vt = ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0]
+    fp = ctypes.cast(vt, ctypes.POINTER(ctypes.c_void_p))[index]
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(fp)(obj, *args)
+
+
 class AudioMeter:
-    """Насколько громко сейчас играет звук (пиковый уровень из Windows) - чтобы "волна" прыгала в такт."""
+    """Насколько громко сейчас играет звук (пиковый уровень из Windows Core Audio) -
+    по нему "волна" прыгает в такт, а пластинка понимает, что музыка идёт."""
 
     def __init__(self):
         self.meter = None
         self.next_try = 0.0
-        self.installing = False
+        self.last = 0.0
+        self.error = None
+
+    def _release(self, obj):
+        try:
+            if obj:
+                _com(obj, 2, [])
+        except Exception:
+            pass
 
     def _init(self):
-        self.next_try = time.time() + 20.0                # заново подключаемся раз в 20 с (смена наушников и т.п.)
+        self.next_try = time.time() + 15.0              # раз в 15 с подключаемся заново (смена наушников и т.п.)
+        self._release(self.meter)
         self.meter = None
         if not IS_WIN or DEMO:
             return
+        enum = ctypes.c_void_p()
+        dev = ctypes.c_void_p()
         try:
-            from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
-            from comtypes import CLSCTX_ALL
-        except ImportError:
-            if not self.installing:
-                self.installing = True
-                threading.Thread(target=lambda: pip_install("pycaw"), daemon=True).start()
-            return
-        try:
-            dev = AudioUtilities.GetSpeakers()
-            imm = getattr(dev, "_dev", dev)
-            iface = imm.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
-            self.meter = ctypes.cast(iface, ctypes.POINTER(IAudioMeterInformation))
-        except Exception:
-            self.meter = None
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitializeEx(None, 2)
+            hr = ole32.CoCreateInstance(ctypes.byref(_guid("BCDE0395-E52F-467C-8E3D-C4579291692E")), None, 23,
+                                        ctypes.byref(_guid("A95664D2-9614-4F35-A746-DE8DB63617E6")),
+                                        ctypes.byref(enum))
+            if hr != 0 or not enum:
+                self.error = "MMDeviceEnumerator: 0x%08X" % (hr & 0xFFFFFFFF)
+                return
+            hr = _com(enum, 4, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], 0, 1, ctypes.byref(dev))
+            if hr != 0 or not dev:
+                self.error = "нет устройства вывода звука: 0x%08X" % (hr & 0xFFFFFFFF)
+                return
+            meter = ctypes.c_void_p()
+            iid = _guid("C02216F6-8C67-4B5B-9D00-D008E73E0064")
+            hr = _com(dev, 3, [ctypes.POINTER(GUID), ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                      ctypes.byref(iid), 23, None, ctypes.byref(meter))
+            if hr != 0 or not meter:
+                self.error = "AudioMeter: 0x%08X" % (hr & 0xFFFFFFFF)
+                return
+            self.meter = meter
+            self.error = None
+        except Exception as ex:
+            self.error = repr(ex)
+        finally:
+            self._release(dev)
+            self._release(enum)
 
     def peak(self):
         """0..1 или None, если узнать нельзя."""
@@ -3128,8 +3170,13 @@ class AudioMeter:
         if self.meter is None:
             return None
         try:
-            return clamp(float(self.meter.GetPeakValue()))
-        except Exception:
+            v = ctypes.c_float()
+            if _com(self.meter, 3, [ctypes.POINTER(ctypes.c_float)], ctypes.byref(v)) != 0:
+                return None
+            self.last = clamp(float(v.value))
+            return self.last
+        except Exception as ex:
+            self.error = repr(ex)
             self.meter = None
             return None
 
@@ -3202,11 +3249,15 @@ class MusicCard(Card):
     def _tick(self, playing, has_track=True):
         t = time.time()
         peak = _METER.peak() if has_track else 0.0
-        if not playing and peak is not None and peak > 0.03 and has_track:
+        if not playing and peak is not None and peak > 0.02 and has_track:
             playing = True                                  # звук идёт - значит, играет
+        if self.cfg.get("spin") == "always" and (self.media.state or {}).get("title"):
+            playing = True
         self._vis_playing = playing
         if not playing:
             peak = 0.0
+        elif peak is not None and peak < 0.02 and self.cfg.get("spin") == "always":
+            peak = None                                     # тишина, но крутить велено - мягкий ритм
         if peak is None:                                    # нет данных о звуке - мягкий "ритм" ~120 уд/мин
             beat = max(0.0, math.sin(t * math.tau * 1.95)) ** 4
             peak = 0.38 + 0.42 * beat + 0.08 * math.sin(t * 7.3) + 0.05 * math.sin(t * 13.1)
@@ -3506,8 +3557,36 @@ class MusicCard(Card):
         open_target("yandexmusic://", os.path.join(local, "Programs", "YandexMusic", "Яндекс Музыка.exe"),
                     "https://music.yandex.ru/")
 
+    def diagnose(self):
+        st = self.media.state or {}
+        peak = _METER.peak()
+        lines = ["Версия виджетов: %s" % APP_VERSION,
+                 "Анимации включены: %s" % ("да" if self.animated else "НЕТ (Оформление → Анимации)"),
+                 "Плеер: %s" % (st.get("app") or "не найден"),
+                 "Трек: %s — %s" % (st.get("artist", ""), st.get("title", "")) if st.get("title") else "Трек: нет",
+                 "Статус от плеера: %s (4 - играет, 5 - пауза, 3 - стоп)" % st.get("status", "?"),
+                 "Программа считает, что играет: %s" % ("да" if st.get("playing") else "нет"),
+                 "Громкость звука сейчас: %s" % ("%.2f" % peak if peak is not None else
+                                                 "неизвестно (%s)" % (_METER.error or "нет данных")),
+                 "Пластинка крутится: %s" % ("да" if getattr(self, "_vis_playing", False) else "нет"),
+                 "Режим пластинки: %s" % ("всегда" if self.cfg.get("spin") == "always" else "когда играет"),
+                 "Ошибка связи с плеером: %s" % (self.media.error or "нет"),
+                 "", "Журналы: " + DATA_DIR]
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(QMessageBox.Icon.Information, "Музыка - диагностика", "\n".join(lines))
+        copy = box.addButton("Скопировать", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is copy:
+            QApplication.clipboard().setText("\n".join(lines))
+
     def extra_menu(self, menu):
         menu.addAction("Открыть Яндекс Музыку").triggered.connect(self.activate)
+        a = menu.addAction("Крутить пластинку всегда (если анимация не включается)")
+        a.setCheckable(True)
+        a.setChecked(self.cfg.get("spin") == "always")
+        a.toggled.connect(lambda v: self.set_opt("spin", "always" if v else None))
+        menu.addAction("Диагностика...").triggered.connect(self.diagnose)
         a = menu.addAction("Только Яндекс Музыка (не другие плееры)")
         a.setCheckable(True)
         a.setChecked(bool(self.mgr.cfg.get("music_only_yandex")))

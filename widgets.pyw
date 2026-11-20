@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Виджеты рабочего стола для Windows 10/11 в стиле macOS.
 
-  * Батарея     - заряд Bluetooth-мыши, клавиатуры, наушников, геймпада и ноутбука.
-  * Фото        - слайд-шоу фотографий из выбранной папки с плавной сменой кадров.
-  * Часы        - аналоговые / цифровые часы с календарём на месяц.
+  * Погода      - температура, прогноз по часам и на неделю, живой фон (снег, дождь, солнце).
+  * Батарея     - заряд мыши / клавиатуры / наушников: Bluetooth и радио-приёмники Logitech
+                  (Unifying, Bolt, Lightspeed), а также батарея ноутбука.
+  * Фото        - слайд-шоу фотографий из папки (например, из "Загрузки\\Telegram Desktop").
+  * Календарь   - листается стрелками и колёсиком мыши, праздники РФ.
+  * Часы        - аналоговые часы с плавной секундной стрелкой.
   * Система     - загрузка процессора, памяти и диска.
 
 Запуск: двойной клик по widgets.pyw (нужен Python 3.9+, PySide6 поставится сам).
@@ -14,6 +17,7 @@
 import calendar
 import ctypes
 import datetime
+import importlib
 import json
 import math
 import os
@@ -24,13 +28,15 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
+import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств
+DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
 
 if IS_WIN:
     _BASE = os.environ.get("APPDATA") or HERE
@@ -75,7 +81,7 @@ def ensure_deps():
     except Exception:
         msgbox("Не получилось установить PySide6 автоматически.\n\n"
                "Открой командную строку (Win+R, cmd) и выполни:\n"
-               "    pip install PySide6\n"
+               "    pip install PySide6 hidapi\n"
                "Потом запусти widgets.pyw снова.", "Виджеты - ошибка", 0x10)
         sys.exit(1)
     subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
@@ -84,17 +90,21 @@ def ensure_deps():
 
 ensure_deps()
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal  # noqa: E402
+from PySide6.QtCore import (QObject, QPointF, QRectF, QStandardPaths, Qt,  # noqa: E402
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import (QActionGroup, QColor, QDesktopServices, QFont,  # noqa: E402
                            QIcon, QImage, QImageReader, QLinearGradient, QPainter,
-                           QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QFileDialog, QMenu,  # noqa: E402
+                           QPainterPath, QPen, QPixmap, QRadialGradient)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMenu,  # noqa: E402
                                QSystemTrayIcon, QWidget)
 
 RH = (QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
       | QPainter.RenderHint.TextAntialiasing)
 FONT = "Segoe UI" if IS_WIN else "Sans Serif"
 NOPEN = Qt.PenStyle.NoPen
+AL, AR, AC = Qt.AlignmentFlag.AlignLeft, Qt.AlignmentFlag.AlignRight, Qt.AlignmentFlag.AlignCenter
+AVC = Qt.AlignmentFlag.AlignVCenter
+SEMI, LIGHT, NORMAL = QFont.Weight.DemiBold, QFont.Weight.Light, QFont.Weight.Normal
 
 MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
               "сентября", "октября", "ноября", "декабря"]
@@ -102,20 +112,29 @@ MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май"
           "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 WD_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+HOLIDAYS = {(1, 1): "Новый год", (1, 2): "Новогодние каникулы", (1, 3): "Новогодние каникулы",
+            (1, 4): "Новогодние каникулы", (1, 5): "Новогодние каникулы", (1, 6): "Новогодние каникулы",
+            (1, 7): "Рождество Христово", (1, 8): "Новогодние каникулы",
+            (2, 23): "День защитника Отечества", (3, 8): "Международный женский день",
+            (5, 1): "Праздник Весны и Труда", (5, 9): "День Победы", (6, 12): "День России",
+            (11, 4): "День народного единства"}
 
 THEMES = {
     "dark": {"bg1": QColor(44, 46, 52, 238), "bg2": QColor(28, 29, 33, 238),
              "fg": QColor(245, 245, 247), "fg2": QColor(160, 162, 170),
-             "track": QColor(255, 255, 255, 38), "line": QColor(255, 255, 255, 26)},
+             "track": QColor(255, 255, 255, 38), "line": QColor(255, 255, 255, 26),
+             "btn": QColor(255, 255, 255, 30)},
     "light": {"bg1": QColor(252, 252, 253, 242), "bg2": QColor(236, 237, 241, 242),
               "fg": QColor(28, 28, 30), "fg2": QColor(120, 120, 128),
-              "track": QColor(0, 0, 0, 30), "line": QColor(0, 0, 0, 22)},
+              "track": QColor(0, 0, 0, 30), "line": QColor(0, 0, 0, 22),
+              "btn": QColor(0, 0, 0, 18)},
 }
 GREEN, YELLOW, RED, BLUE = QColor("#30D158"), QColor("#FFD60A"), QColor("#FF453A"), QColor("#0A84FF")
 ACCENT = QColor("#FF9F0A")
+WHITE = QColor(255, 255, 255)
 
 
-def font(px, weight=QFont.Weight.Normal):
+def font(px, weight=NORMAL):
     f = QFont(FONT)
     f.setPixelSize(max(1, int(px)))
     f.setWeight(weight)
@@ -126,8 +145,42 @@ def level_color(v):
     return RED if v <= 15 else (YELLOW if v <= 30 else GREEN)
 
 
+def clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def ease_out_cubic(t):
+    t = clamp(t)
+    return 1 - (1 - t) ** 3
+
+
+def ease_out_back(t):
+    t = clamp(t)
+    c1 = 1.4
+    return 1 + (c1 + 1) * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+
+def smooth(t):
+    t = clamp(t)
+    return t * t * (3 - 2 * t)
+
+
+def plural(n, one, few, many):
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def deg(t):
+    t = int(round(t))
+    return ("−%d°" % -t) if t < 0 else ("%d°" % t)
+
+
 # ---------------------------------------------------------------------------
-#  Батарея устройств
+#  Батарея устройств: Bluetooth (Windows), радио-приёмники Logitech (HID++), ноутбук
 # ---------------------------------------------------------------------------
 # Windows хранит заряд Bluetooth-устройств (то, что видно в "Параметры -> Bluetooth")
 # в свойстве устройства {104EA319-...} 2. Читаем его одной командой PowerShell.
@@ -148,10 +201,11 @@ if ($d.Count -gt 0) {
 """
 
 KIND_WORDS = (
-    ("mouse", ("mouse", "мыш", "mx master", "mx anywhere", "pebble", "trackball", "m720", "m590")),
-    ("keyboard", ("keyboard", "клавиат", "keys", "mx keys", "k380", "k810")),
+    ("mouse", ("mouse", "мыш", "mx master", "mx anywhere", "pebble", "trackball", "m720", "m590", "g pro",
+               "g502", "g305", "g703", "g903", "lift", "m575")),
+    ("keyboard", ("keyboard", "клавиат", "keys", "k380", "k810", "craft")),
     ("headphones", ("head", "наушн", "buds", "airpods", "earbuds", "wh-", "wf-", "jbl", "bose",
-                    "sony", "airdots", "freebuds", "galaxy buds", "гарнит", "hands-free")),
+                    "airdots", "freebuds", "гарнит", "hands-free")),
     ("gamepad", ("controller", "gamepad", "геймпад", "xbox", "dualsense", "dualshock", "joy-con")),
     ("pen", ("pen", "перо", "stylus")),
 )
@@ -232,11 +286,11 @@ def bt_batteries():
         res = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                               "-Command", _PS_BATTERY], capture_output=True, timeout=60,
                              creationflags=NO_WINDOW)
-        text = res.stdout.decode("utf-8", "replace")
+        text_out = res.stdout.decode("utf-8", "replace")
     except Exception:
         return []
     seen, out = set(), []
-    for line in text.splitlines():
+    for line in text_out.splitlines():
         parts = line.strip().lstrip("﻿").split("\t")
         if len(parts) < 2:
             continue
@@ -252,6 +306,197 @@ def bt_batteries():
     return out
 
 
+# ----- Logitech HID++ 2.0 (мыши и клавиатуры на радио-приёмниках Unifying / Bolt / Lightspeed) -----
+LOGI_VID = 0x046D
+_VOLT_CURVE = ((4186, 100), (4067, 90), (3989, 80), (3922, 70), (3859, 60), (3811, 50), (3778, 40),
+               (3751, 30), (3717, 20), (3671, 10), (3646, 5), (3579, 2), (3500, 0))
+_LOGI_TYPES = {0: "keyboard", 2: "keyboard", 3: "mouse", 4: "mouse", 5: "mouse", 8: "headphones",
+               0x0B: "gamepad", 0x0C: "gamepad"}
+_HID_STATE = {"tried_install": False, "mod": None}
+
+
+def volt_to_pct(mv):
+    if mv >= _VOLT_CURVE[0][0]:
+        return 100
+    for (v1, p1), (v2, p2) in zip(_VOLT_CURVE, _VOLT_CURVE[1:]):
+        if mv >= v2:
+            return int(round(p2 + (p1 - p2) * (mv - v2) / float(v1 - v2)))
+    return 0
+
+
+def _hid_module():
+    """Модуль hidapi; при запуске из .pyw ставим его сам один раз, если его нет."""
+    if _HID_STATE["mod"] is not None:
+        return _HID_STATE["mod"]
+    try:
+        import hid
+        _HID_STATE["mod"] = hid
+        return hid
+    except ImportError:
+        pass
+    if IS_WIN and not FROZEN and not _HID_STATE["tried_install"]:
+        _HID_STATE["tried_install"] = True
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "hidapi"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=NO_WINDOW, timeout=300)
+            importlib.invalidate_caches()
+            import hid
+            _HID_STATE["mod"] = hid
+            return hid
+        except Exception:
+            pass
+    return None
+
+
+class HidPP:
+    """Минимальный клиент протокола Logitech HID++ 2.0 поверх одного HID-интерфейса."""
+    SW = 0x0B          # наш "software id", чтобы отличать ответы от уведомлений
+
+    def __init__(self, dev):
+        self.dev = dev
+
+    def request(self, idx, feat, fn, params=b"", timeout=0.5):
+        fs = ((fn & 0x0F) << 4) | self.SW
+        msg = bytes([0x11, idx & 0xFF, feat & 0xFF, fs]) + bytes(params)
+        msg += bytes(20 - len(msg))
+        try:
+            self.dev.write(list(msg))
+        except Exception:
+            return None
+        end = time.time() + timeout
+        while True:
+            left = int((end - time.time()) * 1000)
+            if left <= 0:
+                return None
+            try:
+                data = self.dev.read(20, left)
+            except Exception:
+                return None
+            if not data or len(data) < 5 or data[1] != (idx & 0xFF):
+                continue
+            if data[0] == 0x11:
+                if data[2] == 0xFF and data[3] == (feat & 0xFF) and data[4] == fs:
+                    return None                                  # ошибка HID++ 2.0
+                if data[2] == (feat & 0xFF) and data[3] == fs:
+                    return bytes(data[4:])
+            elif data[0] == 0x10 and data[2] == 0x8F:            # ошибка HID++ 1.0 (устройство выключено)
+                return None
+
+    def protocol(self, idx, timeout=0.5):
+        r = self.request(idx, 0x00, 1, b"\x00\x00\x5A", timeout)
+        return (r[0], r[1]) if r else None
+
+    def feature(self, idx, fid):
+        r = self.request(idx, 0x00, 0, bytes([fid >> 8, fid & 0xFF]))
+        return r[0] if r and r[0] else None
+
+    def name(self, idx):
+        fi = self.feature(idx, 0x0005)
+        if not fi:
+            return None, None
+        r = self.request(idx, fi, 0)
+        if not r:
+            return None, None
+        n, name = r[0], b""
+        while len(name) < n:
+            c = self.request(idx, fi, 1, bytes([len(name)]))
+            if not c:
+                break
+            name += c[:n - len(name)]
+        t = self.request(idx, fi, 2)
+        kind = _LOGI_TYPES.get(t[0]) if t else None
+        return name.split(b"\x00")[0].decode("utf-8", "replace").strip() or None, kind
+
+    def battery(self, idx):
+        """(процент, заряжается) или None."""
+        fi = self.feature(idx, 0x1004)                     # UNIFIED_BATTERY
+        if fi:
+            r = self.request(idx, fi, 1)
+            if r:
+                soc, lvl, chg = r[0], r[1], r[2]
+                if not 0 < soc <= 100:                     # процент не поддерживается - только уровень
+                    soc = 100 if lvl & 8 else 60 if lvl & 4 else 20 if lvl & 2 else 5 if lvl & 1 else 0
+                return soc, chg in (1, 2, 3)
+        fi = self.feature(idx, 0x1000)                     # BATTERY_STATUS
+        if fi:
+            r = self.request(idx, fi, 0)
+            if r and 0 < r[0] <= 100:
+                return r[0], 1 <= r[2] <= 4
+        fi = self.feature(idx, 0x1001)                     # BATTERY_VOLTAGE
+        if fi:
+            r = self.request(idx, fi, 0)
+            if r:
+                mv = (r[0] << 8) | r[1]
+                return volt_to_pct(mv), bool(r[2] & 0x80)
+        return None
+
+    def device(self, idx):
+        bat = self.battery(idx)
+        if bat is None:
+            return None
+        name, kind = self.name(idx)
+        name = name or "Устройство Logitech"
+        return {"name": name, "level": int(bat[0]), "kind": kind or guess_kind(name), "charging": bat[1]}
+
+
+def logi_paths(hid):
+    """Пути HID-интерфейсов Logitech, через которые идут длинные сообщения HID++."""
+    out = []
+    for d in hid.enumerate(LOGI_VID, 0):
+        up, us = d.get("usage_page", 0), d.get("usage", 0)
+        if up == 0xFF00 and us == 0x0002:                  # Windows / macOS: отдельная "коллекция"
+            out.append(d["path"])
+        elif up == 0 and d.get("interface_number") == 2:   # Linux hidraw: usage не сообщается
+            out.append(d["path"])
+    return list(dict.fromkeys(out))
+
+
+def logi_scan_device(dev):
+    hp = HidPP(dev)
+    found = []
+    ver = hp.protocol(0xFF, 0.4)
+    if ver and ver[0] >= 2:                     # мышь подключена напрямую (провод / свой режим)
+        d = hp.device(0xFF)
+        if d:
+            found.append(d)
+        return found
+    for idx in range(1, 7):                     # устройства на приёмнике
+        ver = hp.protocol(idx, 0.5)
+        if not ver or ver[0] < 2:
+            continue
+        d = hp.device(idx)
+        if d:
+            found.append(d)
+    return found
+
+
+def logi_batteries():
+    hid = _hid_module()
+    if hid is None:
+        return []
+    out = []
+    try:
+        paths = logi_paths(hid)
+    except Exception:
+        return []
+    for path in paths:
+        dev = None
+        try:
+            dev = hid.device()
+            dev.open_path(path)
+            out.extend(logi_scan_device(dev))
+        except Exception:
+            pass
+        finally:
+            try:
+                if dev is not None:
+                    dev.close()
+            except Exception:
+                pass
+    return out
+
+
 def read_devices():
     if DEMO:
         return [{"name": "MX Master 3S", "level": 64, "kind": "mouse", "charging": False},
@@ -259,10 +504,14 @@ def read_devices():
                 {"name": "WH-1000XM4", "level": 90, "kind": "headphones", "charging": False},
                 {"name": "Xbox Wireless Controller", "level": 12, "kind": "gamepad", "charging": False},
                 {"name": "Этот компьютер", "level": 81, "kind": "laptop", "charging": True}]
-    devs = [{"name": name, "level": lvl, "kind": guess_kind(name), "charging": False}
-            for name, lvl in bt_batteries()]
+    devs, seen = [], set()
+    for d in logi_batteries() + [{"name": n, "level": lv, "kind": guess_kind(n), "charging": False}
+                                 for n, lv in bt_batteries()]:
+        if d["name"].lower() not in seen:
+            seen.add(d["name"].lower())
+            devs.append(d)
     order = ("mouse", "keyboard", "headphones", "gamepad", "pen", "bluetooth")
-    devs.sort(key=lambda d: (order.index(d["kind"]), d["name"].lower()))
+    devs.sort(key=lambda d: (order.index(d["kind"]) if d["kind"] in order else 9, d["name"].lower()))
     pc = pc_battery()
     if pc:
         devs.append(pc)
@@ -375,7 +624,95 @@ def gb(n):
 
 
 # ---------------------------------------------------------------------------
-#  Рисование: иконки устройств, кольца
+#  Погода (Open-Meteo: бесплатно и без ключа)
+# ---------------------------------------------------------------------------
+UA = {"User-Agent": "SnowWidgets/" + APP_VERSION}
+WMO = {0: ("Ясно", "clear"), 1: ("Преимущественно ясно", "partly"), 2: ("Переменная облачность", "partly"),
+       3: ("Пасмурно", "cloudy"), 45: ("Туман", "fog"), 48: ("Изморозь", "fog"),
+       51: ("Слабая морось", "rain"), 53: ("Морось", "rain"), 55: ("Сильная морось", "rain"),
+       56: ("Ледяная морось", "rain"), 57: ("Ледяная морось", "rain"),
+       61: ("Небольшой дождь", "rain"), 63: ("Дождь", "rain"), 65: ("Сильный дождь", "rain"),
+       66: ("Ледяной дождь", "rain"), 67: ("Ледяной дождь", "rain"),
+       71: ("Небольшой снег", "snow"), 73: ("Снег", "snow"), 75: ("Сильный снег", "snow"),
+       77: ("Снежная крупа", "snow"), 80: ("Небольшой ливень", "rain"), 81: ("Ливень", "rain"),
+       82: ("Сильный ливень", "rain"), 85: ("Снегопад", "snow"), 86: ("Сильный снегопад", "snow"),
+       95: ("Гроза", "storm"), 96: ("Гроза с градом", "storm"), 99: ("Гроза с градом", "storm")}
+
+
+def wmo(code):
+    return WMO.get(int(code), ("—", "cloudy"))
+
+
+def http_json(url, timeout=15):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def locate_by_ip():
+    """(город, широта, долгота) по IP-адресу."""
+    for url in ("https://ipwho.is/?lang=ru", "https://ipapi.co/json/"):
+        try:
+            j = http_json(url, 10)
+            if j.get("latitude") is not None:
+                return j.get("city") or "Моё место", float(j["latitude"]), float(j["longitude"])
+        except Exception:
+            continue
+    return None
+
+
+def geocode(name):
+    url = ("https://geocoding-api.open-meteo.com/v1/search?count=1&language=ru&format=json&name="
+           + urllib.parse.quote(name))
+    res = http_json(url).get("results") or []
+    if not res:
+        return None
+    r = res[0]
+    return r.get("name") or name, float(r["latitude"]), float(r["longitude"])
+
+
+def fetch_weather(lat, lon):
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m,relative_humidity_2m"
+           "&hourly=temperature_2m,weather_code,is_day"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+           "&timezone=auto&forecast_days=7&wind_speed_unit=ms" % (lat, lon))
+    j = http_json(url)
+    cur, hr, dl = j["current"], j["hourly"], j["daily"]
+    now_h = cur["time"][:13]
+    times = hr["time"]
+    start = next((i for i, t in enumerate(times) if t[:13] >= now_h), 0)
+    hours = []
+    for k, i in enumerate(range(start, min(start + 6, len(times)))):
+        hours.append({"label": "Сейчас" if k == 0 else times[i][11:13],
+                      "temp": hr["temperature_2m"][i], "code": hr["weather_code"][i],
+                      "day": hr["is_day"][i]})
+    days = []
+    for i, d in enumerate(dl["time"]):
+        dd = datetime.date.fromisoformat(d)
+        days.append({"label": "Сегодня" if i == 0 else WD_SHORT[dd.weekday()],
+                     "code": dl["weather_code"][i], "max": dl["temperature_2m_max"][i],
+                     "min": dl["temperature_2m_min"][i]})
+    return {"temp": cur["temperature_2m"], "feels": cur["apparent_temperature"],
+            "code": cur["weather_code"], "day": cur["is_day"], "wind": cur["wind_speed_10m"],
+            "hum": cur["relative_humidity_2m"], "hours": hours, "days": days,
+            "max": days[0]["max"] if days else None, "min": days[0]["min"] if days else None}
+
+
+def demo_weather():
+    code = int(os.environ.get("DEMO_WCODE", "73"))
+    day = int(os.environ.get("DEMO_WDAY", "1"))
+    hours = [{"label": "Сейчас" if k == 0 else "%02d" % ((14 + k) % 24), "temp": -3 - k * 0.6,
+              "code": [code, code, 3, 2, 1, 0][k], "day": day if k < 3 else 0} for k in range(6)]
+    days = [{"label": "Сегодня" if i == 0 else WD_SHORT[(4 + i) % 7], "code": c, "max": mx, "min": mn}
+            for i, (c, mx, mn) in enumerate(((code, -1, -6), (75, -2, -8), (3, 0, -5), (2, 1, -3),
+                                              (61, 3, 0), (0, -2, -9), (71, -4, -11)))]
+    return {"temp": -3.4, "feels": -8.0, "code": code, "day": day, "wind": 4.2, "hum": 86,
+            "hours": hours, "days": days, "max": -1, "min": -6}
+
+
+# ---------------------------------------------------------------------------
+#  Рисование: иконки устройств и погоды, кольца, полосы
 # ---------------------------------------------------------------------------
 def draw_icon(p, kind, cx, cy, s, color):
     """Простые линейные иконки размером примерно s x s."""
@@ -395,9 +732,9 @@ def draw_icon(p, kind, cx, cy, s, color):
         p.setPen(NOPEN)
         p.setBrush(color)
         d = s * 0.075
-        for row, n in ((0, 5), (1, 5)):
-            for i in range(n):
-                x = cx - w / 2 + w * (i + 0.5) / n + (s * 0.04 if row else 0) - (s * 0.02 if row else 0)
+        for row in (0, 1):
+            for i in range(5):
+                x = cx - w / 2 + w * (i + 0.5) / 5 + (s * 0.02 if row else 0)
                 y = cy - h * 0.22 + row * h * 0.24
                 p.drawEllipse(QPointF(x, y), d / 1.4, d / 1.4)
         p.drawRoundedRect(QRectF(cx - w * 0.3, cy + h * 0.2, w * 0.6, d * 1.3), d / 2, d / 2)
@@ -465,6 +802,123 @@ def draw_bolt(p, cx, cy, s, color):
     p.restore()
 
 
+def draw_chevron(p, cx, cy, s, direction, color):
+    pen = QPen(color, max(1.5, s * 0.16))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.save()
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    path = QPainterPath()
+    d = s * 0.22 * direction
+    path.moveTo(cx - d, cy - s * 0.38)
+    path.lineTo(cx + d, cy)
+    path.lineTo(cx - d, cy + s * 0.38)
+    p.drawPath(path)
+    p.restore()
+
+
+def cloud_path(cx, cy, s):
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    path.addEllipse(QPointF(cx - s * 0.22, cy + s * 0.06), s * 0.21, s * 0.21)
+    path.addEllipse(QPointF(cx + s * 0.04, cy - s * 0.07), s * 0.29, s * 0.29)
+    path.addEllipse(QPointF(cx + s * 0.29, cy + s * 0.08), s * 0.19, s * 0.19)
+    path.addRoundedRect(QRectF(cx - s * 0.43, cy + s * 0.05, s * 0.91, s * 0.22), s * 0.11, s * 0.11)
+    return path.simplified()
+
+
+def draw_sun(p, cx, cy, s, t=0.0):
+    p.save()
+    p.setPen(NOPEN)
+    g = QRadialGradient(QPointF(cx, cy), s * 0.5)
+    g.setColorAt(0, QColor(255, 214, 10, 90))
+    g.setColorAt(1, QColor(255, 214, 10, 0))
+    p.setBrush(g)
+    k = 1 + 0.05 * math.sin(t * 2)
+    p.drawEllipse(QPointF(cx, cy), s * 0.5 * k, s * 0.5 * k)
+    pen = QPen(QColor("#FFD60A"), s * 0.07)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    for i in range(8):
+        a = math.radians(i * 45 + t * 12)
+        p.drawLine(QPointF(cx + math.cos(a) * s * 0.3, cy + math.sin(a) * s * 0.3),
+                   QPointF(cx + math.cos(a) * s * 0.42, cy + math.sin(a) * s * 0.42))
+    p.setPen(NOPEN)
+    p.setBrush(QColor("#FFD60A"))
+    p.drawEllipse(QPointF(cx, cy), s * 0.21, s * 0.21)
+    p.restore()
+
+
+def draw_moon(p, cx, cy, s):
+    a = QPainterPath()
+    a.addEllipse(QPointF(cx, cy), s * 0.27, s * 0.27)
+    b = QPainterPath()
+    b.addEllipse(QPointF(cx + s * 0.14, cy - s * 0.1), s * 0.23, s * 0.23)
+    p.save()
+    p.setPen(NOPEN)
+    p.setBrush(QColor("#F4F1C9"))
+    p.drawPath(a.subtracted(b))
+    p.restore()
+
+
+def draw_wicon(p, kind, is_day, cx, cy, s, t=0.0):
+    """Цветная иконка погоды размером примерно s x s; t - время для анимации."""
+    bob = math.sin(t * 1.3) * s * 0.025
+    if kind == "clear":
+        if is_day:
+            draw_sun(p, cx, cy, s, t)
+        else:
+            draw_moon(p, cx, cy, s)
+        return
+    p.save()
+    p.setPen(NOPEN)
+    if kind == "partly":
+        if is_day:
+            draw_sun(p, cx + s * 0.16, cy - s * 0.14, s * 0.8, t)
+        else:
+            draw_moon(p, cx + s * 0.18, cy - s * 0.16, s * 0.75)
+        p.setBrush(QColor(255, 255, 255, 245))
+        p.drawPath(cloud_path(cx - s * 0.06 + math.sin(t * 0.7) * s * 0.03, cy + s * 0.08, s * 0.8))
+    elif kind == "fog":
+        pen = QPen(QColor(255, 255, 255, 220), s * 0.09)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for i, (w, dx) in enumerate(((0.7, 0.0), (0.56, 0.1), (0.66, -0.06))):
+            sh = math.sin(t * 0.8 + i) * s * 0.04
+            y = cy - s * 0.18 + i * s * 0.18
+            p.drawLine(QPointF(cx - s * w / 2 + dx * s + sh, y), QPointF(cx + s * w / 2 + dx * s + sh, y))
+    else:
+        top = cy - s * 0.1 + bob
+        if kind == "cloudy":
+            p.setBrush(QColor(205, 212, 224))
+            p.drawPath(cloud_path(cx + s * 0.14, cy - s * 0.12 + bob * 0.5, s * 0.62))
+            p.setBrush(QColor(255, 255, 255, 245))
+            top = cy + bob
+        else:
+            p.setBrush(QColor(150, 158, 175) if kind == "storm" else QColor(228, 233, 242))
+        p.drawPath(cloud_path(cx, top, s * (0.86 if kind == "cloudy" else 0.9)))
+        if kind == "rain":
+            pen = QPen(QColor("#64D2FF"), s * 0.07)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            for i in range(3):
+                ph = (t * 1.6 + i * 0.33) % 1.0
+                x = cx - s * 0.2 + i * s * 0.2
+                y = cy + s * 0.22 + ph * s * 0.14
+                p.drawLine(QPointF(x, y), QPointF(x - s * 0.05, y + s * 0.1))
+        elif kind == "snow":
+            p.setBrush(WHITE)
+            for i in range(3):
+                ph = (t * 0.6 + i * 0.33) % 1.0
+                x = cx - s * 0.2 + i * s * 0.2 + math.sin(t * 2 + i) * s * 0.02
+                y = cy + s * 0.26 + ph * s * 0.14
+                p.drawEllipse(QPointF(x, y), s * 0.05, s * 0.05)
+        elif kind == "storm":
+            draw_bolt(p, cx, cy + s * 0.32, s * 0.36, QColor("#FFD60A"))
+    p.restore()
+
+
 def draw_ring(p, cx, cy, r, width, frac, color, track):
     p.save()
     rc = QRectF(cx - r, cy - r, 2 * r, 2 * r)
@@ -473,7 +927,7 @@ def draw_ring(p, cx, cy, r, width, frac, color, track):
     p.setPen(pen)
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.drawEllipse(rc)
-    frac = max(0.0, min(1.0, frac))
+    frac = clamp(frac)
     if frac > 0.004:
         pen.setColor(color)
         p.setPen(pen)
@@ -487,14 +941,14 @@ def draw_bar(p, rc, frac, color, track):
     p.setBrush(track)
     rad = rc.height() / 2
     p.drawRoundedRect(rc, rad, rad)
-    frac = max(0.0, min(1.0, frac))
+    frac = clamp(frac)
     if frac > 0:
         p.setBrush(color)
         p.drawRoundedRect(QRectF(rc.x(), rc.y(), max(rc.height(), rc.width() * frac), rc.height()), rad, rad)
     p.restore()
 
 
-def text(p, rc, s, f, color, align=Qt.AlignmentFlag.AlignCenter, elide=True):
+def text(p, rc, s, f, color, align=AC, elide=True):
     p.setFont(f)
     p.setPen(color)
     if elide:
@@ -503,7 +957,7 @@ def text(p, rc, s, f, color, align=Qt.AlignmentFlag.AlignCenter, elide=True):
 
 
 # ---------------------------------------------------------------------------
-#  Базовый виджет: окно без рамки, скруглённая карточка, перетаскивание, меню
+#  Базовый виджет: окно без рамки, скруглённая карточка, анимации, перетаскивание, меню
 # ---------------------------------------------------------------------------
 SIZES = {"s": (170, 170), "m": (360, 170), "l": (360, 376), "xl": (552, 376)}
 SIZE_NAMES = {"s": "Маленький", "m": "Средний", "l": "Большой", "xl": "Огромный"}
@@ -523,6 +977,18 @@ class Card(QWidget):
         self.mgr, self.cfg = mgr, cfg
         self._drag = None
         self._moved = False
+        self._press = False
+        self._hits = []                    # [(QRectF, функция)] - кликабельные места, заполняются в paint
+        self._av = {}                      # плавно анимируемые значения
+        self._t_last = time.time()
+        self._dt = 0.0
+        self._frame_ms = 0
+        self._born = None                  # время начала появления
+        self._dying = None                 # время начала исчезновения
+        self._on_dead = None
+        self._ft = QTimer(self)
+        self._ft.setSingleShot(True)
+        self._ft.timeout.connect(self.update)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setWindowTitle("Виджет: " + self.TITLE)
@@ -536,6 +1002,10 @@ class Card(QWidget):
     @property
     def theme(self):
         return THEMES[self.mgr.cfg.get("theme", "dark")]
+
+    @property
+    def animated(self):
+        return bool(self.mgr.cfg.get("animations", True))
 
     def _apply_flags(self):
         f = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -558,8 +1028,9 @@ class Card(QWidget):
     def set_size(self, size):
         self.cfg["size"] = size
         self._apply_size()
+        self.keep_on_screen()
         self.size_changed()
-        self.update()
+        self.appear()
         self.mgr.save()
 
     def size_changed(self):
@@ -586,12 +1057,80 @@ class Card(QWidget):
                 pass
         return False, 0
 
+    # ----- анимации -----
+    def appear(self, delay=0.0):
+        self._born = time.time() + (delay if self.animated else 0.0)
+        self.update()
+
+    def vanish(self, on_dead):
+        if not self.animated:
+            on_dead()
+            return
+        self._dying, self._on_dead = time.time(), on_dead
+        self.update()
+
+    def want_frame(self, ms=16):
+        """Попросить следующий кадр через ms миллисекунд."""
+        self._frame_ms = ms if not self._frame_ms else min(self._frame_ms, ms)
+
+    def av(self, key, target, speed=7.0, start=None):
+        """Плавно анимируемое значение: каждый кадр приближается к target."""
+        cur = self._av.get(key)
+        if cur is None:
+            cur = target if (start is None or not self.animated) else start
+        if not self.animated:
+            cur = target
+        else:
+            cur += (target - cur) * (1.0 - math.exp(-self._dt * speed))
+            if abs(target - cur) < 0.003 * max(1.0, abs(target)):
+                cur = target
+            else:
+                self.want_frame(16)
+        self._av[key] = cur
+        return cur
+
+    def hit(self, rc, fn):
+        self._hits.append((QRectF(rc), fn))
+
     # ----- рисование -----
     def paintEvent(self, _ev):
+        now = time.time()
+        self._dt = clamp(now - self._t_last, 0.0, 0.05)
+        self._t_last = now
+        self._frame_ms = 0
+        self._hits = []
+        e = 1.0
+        if self._born is not None:
+            t = (now - self._born) / 0.5
+            if t < 1.0:
+                e = max(0.0, t)
+                self.want_frame(16)
+            else:
+                self._born = None
+        if self._dying is not None:
+            t = (now - self._dying) / 0.22
+            if t >= 1.0:
+                cb, self._on_dead, self._dying = self._on_dead, None, None
+                QTimer.singleShot(0, self.hide)
+                if cb:
+                    QTimer.singleShot(0, cb)
+                return
+            e = 1.0 - t
+            self.want_frame(16)
+        press = self.av("_press", 1.0 if self._press else 0.0, 22)
+        if e <= 0.0:
+            self._schedule()
+            return
         p = QPainter(self)
         p.setRenderHints(RH)
         r = self.card_rect()
         th = self.theme
+        scale = (0.86 + 0.14 * ease_out_back(e)) * (1.0 - 0.035 * press)
+        p.setOpacity(ease_out_cubic(e))
+        c = r.center()
+        p.translate(c)
+        p.scale(scale, scale)
+        p.translate(-c)
         p.setPen(NOPEN)
         for i in range(MARGIN, 0, -2):                       # мягкая тень
             a = int(26 * (1 - i / MARGIN) ** 2) + 1
@@ -599,10 +1138,7 @@ class Card(QWidget):
             p.drawRoundedRect(r.adjusted(-i * 0.7, -i * 0.5, i * 0.7, i * 0.9), RADIUS + i * 0.6, RADIUS + i * 0.6)
         path = QPainterPath()
         path.addRoundedRect(r, RADIUS, RADIUS)
-        g = QLinearGradient(r.topLeft(), r.bottomLeft())
-        g.setColorAt(0, th["bg1"])
-        g.setColorAt(1, th["bg2"])
-        p.fillPath(path, g)
+        self.paint_bg(p, path, r, th)
         p.save()
         p.setClipPath(path)
         try:
@@ -614,38 +1150,81 @@ class Card(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), RADIUS, RADIUS)
         p.end()
+        self._schedule()
+
+    def _schedule(self):
+        if self._frame_ms and not self._ft.isActive():
+            self._ft.start(self._frame_ms)
+
+    def paint_bg(self, p, path, r, th):
+        g = QLinearGradient(r.topLeft(), r.bottomLeft())
+        g.setColorAt(0, th["bg1"])
+        g.setColorAt(1, th["bg2"])
+        p.fillPath(path, g)
 
     def paint(self, p, r, th):
         pass
 
     # ----- мышь -----
+    def _hit_at(self, pos):
+        for rc, fn in reversed(self._hits):
+            if rc.contains(pos):
+                return fn
+        return None
+
     def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton and not self.mgr.cfg.get("locked"):
-            self._drag = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            self._moved = False
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        self._drag = (None if self.mgr.cfg.get("locked")
+                      else ev.globalPosition().toPoint() - self.frameGeometry().topLeft())
+        self._moved = False
+        if self._hit_at(ev.position()) is None:
+            self._press = True
+            self.update()
 
     def mouseMoveEvent(self, ev):
         if self._drag is not None and ev.buttons() & Qt.MouseButton.LeftButton:
             pos = ev.globalPosition().toPoint() - self._drag
-            if (pos - self.pos()).manhattanLength() > 2:
-                self._moved = True
+            if not self._moved and (pos - self.pos()).manhattanLength() <= 3:
+                return
+            self._moved = True
+            self._press = False
             self.move(pos)
 
     def mouseReleaseEvent(self, ev):
-        if self._drag is not None and self._moved:
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        self._press = False
+        self.update()
+        if self._moved:
             x = round((self.x() + MARGIN) / GRID) * GRID - MARGIN       # прилипание к сетке
             y = round((self.y() + MARGIN) / GRID) * GRID - MARGIN
             self.move(x, y)
             self.keep_on_screen()
             self.cfg["x"], self.cfg["y"] = self.x(), self.y()
             self.mgr.save()
-        elif self._drag is not None and ev.button() == Qt.MouseButton.LeftButton:
-            self.clicked(ev.position())
+        else:
+            fn = self._hit_at(ev.position())
+            if fn is not None:
+                fn()
+            else:
+                self.clicked(ev.position())
         self._drag = None
+        self._moved = False
 
     def mouseDoubleClickEvent(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
-            self.activate()
+            fn = self._hit_at(ev.position())
+            if fn is not None:
+                fn()                    # быстрые клики по стрелкам календаря листают дальше
+            else:
+                self.activate()
+
+    def wheelEvent(self, ev):
+        self.wheel(ev.position(), ev.angleDelta().y())
+
+    def wheel(self, pos, delta):
+        pass
 
     def clicked(self, pos):
         pass
@@ -691,6 +1270,203 @@ class Card(QWidget):
 
 
 # ---------------------------------------------------------------------------
+#  Календарь, который листается (общий для виджетов "Календарь" и "Часы")
+# ---------------------------------------------------------------------------
+class CalendarMixin:
+    def cal_init(self):
+        self.cal_off = 0
+        self.cal_prev = 0
+        self.cal_dir = 1
+        self.cal_t0 = 0.0
+        self._cal_rect = QRectF()
+        self.cal_back = QTimer(self)                 # через 2 минуты без действий - снова текущий месяц
+        self.cal_back.setSingleShot(True)
+        self.cal_back.timeout.connect(self.cal_today)
+
+    def cal_move(self, d):
+        if not d:
+            return
+        self.cal_prev = self.cal_off
+        self.cal_off += d
+        self.cal_dir = 1 if d > 0 else -1
+        self.cal_t0 = time.time() if self.animated else 0.0
+        if self.cal_off:
+            self.cal_back.start(120 * 1000)
+        self.update()
+
+    def cal_today(self):
+        self.cal_move(-self.cal_off)
+
+    @staticmethod
+    def _ym(off):
+        t = datetime.date.today()
+        m = t.month - 1 + off
+        return t.year + m // 12, m % 12 + 1
+
+    def draw_month(self, p, grid, year, month, th, fs):
+        today = datetime.date.today()
+        weeks = calendar.Calendar(0).monthdayscalendar(year, month)
+        cw = grid.width() / 7
+        ch = grid.height() / 7
+        for i, wd in enumerate(WD_SHORT):
+            text(p, QRectF(grid.x() + i * cw, grid.y(), cw, ch), wd, font(fs * 0.85, SEMI),
+                 th["fg2"] if i < 5 else QColor(255, 69, 58, 170))
+        for wi, week in enumerate(weeks):
+            for i, day in enumerate(week):
+                if not day:
+                    continue
+                cell = QRectF(grid.x() + i * cw, grid.y() + (wi + 1) * ch, cw, ch)
+                hol = (month, day) in HOLIDAYS
+                col = th["fg"] if i < 5 and not hol else QColor(255, 105, 97)
+                is_today = (year, month, day) == (today.year, today.month, today.day)
+                if is_today:
+                    d = min(cw, ch) * 0.9
+                    p.setPen(NOPEN)
+                    p.setBrush(RED)
+                    p.drawEllipse(cell.center(), d / 2, d / 2)
+                    col = WHITE
+                text(p, cell, str(day), font(fs, SEMI if (is_today or hol) else NORMAL), col)
+                if hol and not is_today:
+                    p.setPen(NOPEN)
+                    p.setBrush(QColor(255, 105, 97, 200))
+                    p.drawEllipse(QPointF(cell.center().x(), cell.bottom() - ch * 0.1), 1.6, 1.6)
+
+    def paint_calendar(self, p, rc, th, fs, big=False):
+        """Заголовок со стрелками + сетка месяца с анимацией перелистывания."""
+        y, m = self._ym(self.cal_off)
+        hh = fs * 2.0
+        bs = hh * 0.95                                            # размер кнопки-стрелки
+        title = (MONTHS[m - 1] + " " + str(y)) if big else MONTHS[m - 1].upper()
+        if not big and y != datetime.date.today().year:
+            title += " " + str(y)
+        tf = font(fs * (1.25 if big else 1.0), SEMI)
+        trc = QRectF(rc.x(), rc.y(), rc.width() - 2 * bs - 6, hh)
+        text(p, trc, title, tf, th["fg"] if big else ACCENT, AL | AVC)
+        p.setFont(tf)
+        title_w = p.fontMetrics().horizontalAdvance(title)
+        self.hit(QRectF(trc.x(), trc.y(), min(trc.width(), title_w + 6), hh), self.cal_today)
+        for k, d in ((0, -1), (1, 1)):
+            cx = rc.right() - bs * (1.5 - k) - (0 if k else 4)
+            cy = rc.y() + hh / 2
+            hov = QRectF(cx - bs / 2, cy - bs / 2, bs, bs)
+            p.setPen(NOPEN)
+            p.setBrush(th["btn"])
+            p.drawEllipse(hov.center(), bs * 0.42, bs * 0.42)
+            draw_chevron(p, cx, cy, bs * 0.42, d, th["fg"])
+            self.hit(hov, lambda d=d: self.cal_move(d))
+        if self.cal_off:
+            pf = font(fs * 0.85, SEMI)
+            p.setFont(pf)
+            pw = p.fontMetrics().horizontalAdvance("Сегодня") + fs * 1.2
+            pill = QRectF(rc.right() - 2 * bs - 10 - pw, rc.y() + hh * 0.15, pw, hh * 0.7)
+            if pill.left() > rc.x() + title_w + 8:
+                p.setPen(NOPEN)
+                p.setBrush(QColor(255, 69, 58, 210))
+                p.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+                text(p, pill, "Сегодня", pf, WHITE)
+                self.hit(pill, self.cal_today)
+        grid = QRectF(rc.x(), rc.y() + hh + fs * 0.2, rc.width(), rc.bottom() - rc.y() - hh - fs * 0.2)
+        self._cal_rect = QRectF(rc)
+        e = ease_out_cubic((time.time() - self.cal_t0) / 0.38) if self.cal_t0 else 1.0
+        if e < 1.0:
+            self.want_frame(16)
+            p.save()
+            p.setClipRect(grid.adjusted(-2, -2, 2, 2), Qt.ClipOperation.IntersectClip)
+            w = grid.width()
+            py, pm = self._ym(self.cal_prev)
+            op = p.opacity()
+            p.translate(-self.cal_dir * w * e, 0)
+            p.setOpacity(op * (1 - e))
+            self.draw_month(p, grid, py, pm, th, fs)
+            p.translate(self.cal_dir * w, 0)
+            p.setOpacity(op * e)
+            self.draw_month(p, grid, y, m, th, fs)
+            p.restore()
+        else:
+            self.draw_month(p, grid, y, m, th, fs)
+
+    def wheel(self, pos, delta):
+        if delta and self._cal_rect.contains(pos):
+            self.cal_move(-1 if delta > 0 else 1)
+
+
+def next_holiday(today):
+    best = None
+    for (m, d), name in HOLIDAYS.items():
+        if name == "Новогодние каникулы":
+            continue
+        dt = datetime.date(today.year, m, d)
+        if dt <= today:
+            dt = datetime.date(today.year + 1, m, d)
+        if best is None or dt < best[0]:
+            best = (dt, name)
+    return best
+
+
+# ---------------------------------------------------------------------------
+#  Виджет "Календарь"
+# ---------------------------------------------------------------------------
+class CalendarCard(CalendarMixin, Card):
+    KIND = "calendar"
+    TITLE = "Календарь"
+    DEFAULT_SIZE = "m"
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        self.cal_init()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(30 * 1000)
+
+    def paint(self, p, r, th):
+        today = datetime.date.today()
+        size = self.cfg["size"]
+        if size == "s":
+            self._today_block(p, QRectF(r.x() + 18, r.y() + 16, r.width() - 36, r.height() - 30), today, th, 54)
+            return
+        if size == "m":
+            self._today_block(p, QRectF(r.x() + 20, r.y() + 16, r.width() * 0.42 - 20, r.height() - 30),
+                              today, th, 50)
+            self.paint_calendar(p, QRectF(r.x() + r.width() * 0.44, r.y() + 12, r.width() * 0.56 - 16,
+                                          r.height() - 22), th, 11)
+            return
+        self.paint_calendar(p, QRectF(r.x() + 18, r.y() + 16, r.width() - 36, r.height() - 92), th, 15, big=True)
+        p.setPen(QPen(th["line"], 1))
+        p.drawLine(QPointF(r.x() + 18, r.bottom() - 70), QPointF(r.right() - 18, r.bottom() - 70))
+        _y, m = self._ym(self.cal_off)
+        hols = [(d, n) for (mm, d), n in sorted(HOLIDAYS.items()) if mm == m and n != "Новогодние каникулы"]
+        if hols:
+            title, lines = "Праздники", ", ".join("%d — %s" % (d, n) for d, n in hols[:2])
+        else:
+            nh = next_holiday(today)
+            days = (nh[0] - today).days
+            title = nh[1]
+            lines = "через %d %s — %d %s" % (days, plural(days, "день", "дня", "дней"), nh[0].day,
+                                             MONTHS_GEN[nh[0].month - 1])
+        text(p, QRectF(r.x() + 18, r.bottom() - 62, r.width() - 36, 20), title, font(12, SEMI),
+             QColor(255, 105, 97), AL | AVC)
+        text(p, QRectF(r.x() + 18, r.bottom() - 42, r.width() - 36, 20), lines, font(12), th["fg2"], AL | AVC)
+
+    def _today_block(self, p, rc, today, th, big):
+        text(p, QRectF(rc.x(), rc.y(), rc.width(), 18), WEEKDAYS[today.weekday()].upper(), font(12, SEMI), RED, AL)
+        text(p, QRectF(rc.x(), rc.y() + 12, rc.width(), big * 1.3), str(today.day), font(big, LIGHT), th["fg"], AL)
+        text(p, QRectF(rc.x(), rc.y() + 14 + big * 1.22, rc.width(), 18),
+             "%s %d" % (MONTHS_GEN[today.month - 1], today.year), font(13), th["fg2"], AL)
+        info = HOLIDAYS.get((today.month, today.day))
+        if not info:
+            nh = next_holiday(today)
+            days = (nh[0] - today).days
+            info = "%s через %d %s" % (nh[1], days, plural(days, "день", "дня", "дней"))
+        p.setFont(font(11))
+        p.setPen(th["fg2"])
+        p.drawText(QRectF(rc.x(), rc.bottom() - 30, rc.width(), 32),
+                   int(AL | Qt.AlignmentFlag.AlignBottom | Qt.TextFlag.TextWordWrap), info)
+
+    def activate(self):
+        self.cal_today()
+
+
+# ---------------------------------------------------------------------------
 #  Виджет "Батарея"
 # ---------------------------------------------------------------------------
 class BatteryCard(Card):
@@ -709,59 +1485,65 @@ class BatteryCard(Card):
             devs = sorted(devs, key=lambda d: d["name"] != want)
         return devs
 
+    def lvl(self, d):
+        return self.av("b:" + d["name"], float(d["level"]), 4.0, start=0.0)
+
     def paint(self, p, r, th):
         devs = self.devices()
         size = self.cfg["size"]
         if not devs:
-            msg = ("Ищу устройства..." if self.mgr.battery.stamp is None
-                   else "Нет устройств\nс известным зарядом")
-            draw_icon(p, "bluetooth", r.center().x(), r.y() + r.height() * 0.38, 34, th["fg2"])
-            text(p, QRectF(r.x() + 10, r.y() + r.height() * 0.55, r.width() - 20, 44), msg,
-                 font(13), th["fg2"], elide=False)
+            draw_icon(p, "mouse", r.center().x(), r.y() + (r.height() * 0.28 if size != "s" else 46), 30, th["fg2"])
+            if self.mgr.battery.stamp is None:
+                msg = "Ищу устройства..."
+            elif size == "s":
+                msg = "Нет устройств\nс известным зарядом"
+            else:
+                msg = ("Нет устройств с известным зарядом.\nПоддерживаются Bluetooth и радио-мыши Logitech\n"
+                       "(Unifying, Bolt, Lightspeed).")
+            p.setFont(font(12))
+            p.setPen(th["fg2"])
+            p.drawText(QRectF(r.x() + 12, r.y() + r.height() * (0.45 if size != "s" else 0.5), r.width() - 24,
+                              r.height() * 0.5), int(AC | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
             return
         if size == "s":
             d = devs[0]
+            v = self.lvl(d)
             cx, cy, rad = r.center().x(), r.y() + 70, 44
-            self._ring(p, d, cx, cy, rad, 9, th, 38)
-            text(p, QRectF(r.x(), r.y() + 120, r.width(), 26), "%d%%" % d["level"],
-                 font(22, QFont.Weight.DemiBold), th["fg"])
+            self._ring(p, d, v, cx, cy, rad, 9, th, 38)
+            text(p, QRectF(r.x(), r.y() + 120, r.width(), 26), "%d%%" % round(v), font(22, SEMI), th["fg"])
             text(p, QRectF(r.x() + 12, r.y() + 144, r.width() - 24, 18), d["name"], font(12), th["fg2"])
         elif size == "m":
             n = min(4, len(devs))
             slot = r.width() / 4
             x0 = r.x() + (r.width() - slot * n) / 2
             for i, d in enumerate(devs[:n]):
+                v = self.lvl(d)
                 cx = x0 + slot * (i + 0.5)
-                self._ring(p, d, cx, r.y() + 66, 34, 7, th, 28)
-                text(p, QRectF(cx - slot / 2, r.y() + 110, slot, 22), "%d%%" % d["level"],
-                     font(16, QFont.Weight.DemiBold), th["fg"])
+                self._ring(p, d, v, cx, r.y() + 66, 34, 7, th, 28)
+                text(p, QRectF(cx - slot / 2, r.y() + 110, slot, 22), "%d%%" % round(v), font(16, SEMI), th["fg"])
                 text(p, QRectF(cx - slot / 2 + 4, r.y() + 132, slot - 8, 18), d["name"], font(11), th["fg2"])
         else:
-            text(p, QRectF(r.x() + 20, r.y() + 14, r.width() - 40, 24), "Батарея",
-                 font(15, QFont.Weight.DemiBold), th["fg"], Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            text(p, QRectF(r.x() + 20, r.y() + 14, r.width() - 40, 24), "Батарея", font(15, SEMI), th["fg"], AL | AVC)
             if self.mgr.battery.stamp:
                 text(p, QRectF(r.x() + 20, r.y() + 14, r.width() - 40, 24),
-                     self.mgr.battery.stamp.strftime("%H:%M"), font(12), th["fg2"],
-                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                     self.mgr.battery.stamp.strftime("%H:%M"), font(12), th["fg2"], AR | AVC)
             row = 54
             for i, d in enumerate(devs[:6]):
+                v = self.lvl(d)
                 y = r.y() + 48 + i * row
-                col = level_color(d["level"])
                 p.setPen(NOPEN)
                 p.setBrush(th["track"])
                 p.drawEllipse(QPointF(r.x() + 40, y + row / 2), 19, 19)
                 draw_icon(p, d["kind"], r.x() + 40, y + row / 2, 22, th["fg"])
-                text(p, QRectF(r.x() + 70, y + 6, r.width() - 150, 20), d["name"], font(13), th["fg"],
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                text(p, QRectF(r.right() - 80, y + 6, 60, 20), "%d%%" % d["level"],
-                     font(14, QFont.Weight.DemiBold), th["fg"],
-                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                draw_bar(p, QRectF(r.x() + 70, y + 31, r.width() - 90, 7), d["level"] / 100.0, col, th["track"])
+                text(p, QRectF(r.x() + 70, y + 6, r.width() - 150, 20), d["name"], font(13), th["fg"], AL | AVC)
+                text(p, QRectF(r.right() - 80, y + 6, 60, 20), "%d%%" % round(v), font(14, SEMI), th["fg"], AR | AVC)
+                draw_bar(p, QRectF(r.x() + 70, y + 31, r.width() - 90, 7), v / 100.0,
+                         level_color(d["level"]), th["track"])
                 if d.get("charging"):
                     draw_bolt(p, r.right() - 96, y + 16, 14, GREEN)
 
-    def _ring(self, p, d, cx, cy, rad, width, th, icon):
-        draw_ring(p, cx, cy, rad, width, d["level"] / 100.0, level_color(d["level"]), th["track"])
+    def _ring(self, p, d, v, cx, cy, rad, width, th, icon):
+        draw_ring(p, cx, cy, rad, width, v / 100.0, level_color(d["level"]), th["track"])
         draw_icon(p, d["kind"], cx, cy, icon, th["fg"])
         if d.get("charging"):
             p.setPen(NOPEN)
@@ -781,8 +1563,6 @@ class BatteryCard(Card):
                 a.setChecked(self.cfg.get("device") == name)
                 grp.addAction(a)
                 a.triggered.connect(lambda _=False, n=name: self._pick(n))
-        menu.addAction("Открыть настройки Bluetooth").triggered.connect(
-            lambda: QDesktopServices.openUrl(QUrl("ms-settings:bluetooth")))
 
     def _pick(self, name):
         self.cfg["device"] = name
@@ -796,7 +1576,12 @@ class BatteryCard(Card):
 # ---------------------------------------------------------------------------
 #  Виджет "Фото"
 # ---------------------------------------------------------------------------
-IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".heic"}
+IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif"}
+KB_ZOOM = 1.12           # запас картинки под эффект медленного приближения
+
+
+def is_image(name):
+    return os.path.splitext(name)[1].lower() in IMG_EXT
 
 
 def list_images(folder, recursive):
@@ -805,15 +1590,52 @@ def list_images(folder, recursive):
         if recursive:
             for root, dirs, files in os.walk(folder):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
-                out.extend(os.path.join(root, f) for f in files if os.path.splitext(f)[1].lower() in IMG_EXT)
+                out.extend(os.path.join(root, f) for f in files if is_image(f))
                 if len(out) > 50000:
                     break
         else:
-            out = [os.path.join(folder, f) for f in os.listdir(folder)
-                   if os.path.splitext(f)[1].lower() in IMG_EXT]
+            out = [os.path.join(folder, f) for f in os.listdir(folder) if is_image(f)]
     except Exception:
         pass
     out.sort(key=lambda s: s.lower())
+    return out
+
+
+def count_images(folder):
+    try:
+        return sum(1 for f in os.listdir(folder) if is_image(f))
+    except Exception:
+        return 0
+
+
+def photo_places():
+    """Папки, где обычно лежат фото: Telegram, Изображения, OneDrive, Загрузки, Рабочий стол."""
+    loc = QStandardPaths.StandardLocation
+    home = os.path.expanduser("~")
+    dl = QStandardPaths.writableLocation(loc.DownloadLocation) or os.path.join(home, "Downloads")
+    docs = QStandardPaths.writableLocation(loc.DocumentsLocation) or os.path.join(home, "Documents")
+    pics = QStandardPaths.writableLocation(loc.PicturesLocation) or os.path.join(home, "Pictures")
+    desk = QStandardPaths.writableLocation(loc.DesktopLocation) or os.path.join(home, "Desktop")
+    cands = [("Telegram", os.path.join(dl, "Telegram Desktop")),
+             ("Telegram", os.path.join(home, "Downloads", "Telegram Desktop")),
+             ("Telegram", os.path.join(docs, "Telegram Desktop")),
+             ("Изображения", pics)]
+    od = os.environ.get("OneDrive")
+    if od:
+        cands += [("OneDrive", os.path.join(od, "Pictures")), ("OneDrive", os.path.join(od, "Изображения"))]
+    cands += [("Загрузки", dl), ("Рабочий стол", desk)]
+    out, seen = [], set()
+    for label, path in cands:
+        try:
+            if not os.path.isdir(path):
+                continue
+            key = os.path.normcase(os.path.realpath(path))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label, os.path.normpath(path)))
     return out
 
 
@@ -822,8 +1644,10 @@ def load_cover(path, w, h):
     rd = QImageReader(path)
     rd.setAutoTransform(True)                 # поворот по EXIF
     src = rd.size()
+    if src.isValid() and (src.width() < 200 or src.height() < 200):
+        return None                           # стикеры и значки пропускаем
     if src.isValid() and src.width() > 0 and src.height() > 0:
-        k = max(w / src.width(), h / src.height()) * 1.6     # грузим чуть больше, но не весь снимок
+        k = max(w / src.width(), h / src.height()) * 1.5     # грузим чуть больше, но не весь снимок
         if k < 1.0:
             rd.setScaledSize(src * k)
     img = rd.read()
@@ -836,6 +1660,29 @@ def load_cover(path, w, h):
     return img.copy(x, y, w, h).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
 
 
+class Shot:
+    """Показанная фотография и её медленное движение (эффект Кена Бёрнса, как на Mac).
+    Картинка загружена с запасом zmax: видимая часть плавно приближается/отдаляется и сдвигается."""
+
+    def __init__(self, img, path, zmax):
+        self.img, self.path, self.zmax, self.t0 = img, path, zmax, time.time()
+        self.z0, self.z1 = (1.0, zmax) if random.random() < 0.5 else (zmax, 1.0)
+        self.c0 = (random.uniform(-1, 1), random.uniform(-1, 1))
+        self.c1 = (random.uniform(-1, 1), random.uniform(-1, 1))
+
+    def draw(self, p, r, period, moving):
+        iw, ih = self.img.width(), self.img.height()
+        if moving and self.zmax > 1.0:
+            u = clamp((time.time() - self.t0) / max(1.0, period))
+            z = self.z0 + (self.z1 - self.z0) * u
+            cx = self.c0[0] + (self.c1[0] - self.c0[0]) * u
+            cy = self.c0[1] + (self.c1[1] - self.c0[1]) * u
+        else:
+            z, cx, cy = self.zmax, 0.0, 0.0
+        sw, sh = iw / z, ih / z
+        p.drawImage(r, self.img, QRectF((iw - sw) / 2 * (1 + cx), (ih - sh) / 2 * (1 + cy), sw, sh))
+
+
 class PhotoCard(Card):
     KIND = "photos"
     TITLE = "Фото"
@@ -843,7 +1690,7 @@ class PhotoCard(Card):
     DEFAULT_SIZE = "l"
     INTERVALS = ((5, "5 секунд"), (10, "10 секунд"), (30, "30 секунд"), (60, "1 минута"),
                  (300, "5 минут"), (900, "15 минут"), (3600, "1 час"))
-    FADE = 0.9
+    FADE = 1.0
     _listed = Signal(object, object)
     _loaded = Signal(object, object, object)
 
@@ -853,8 +1700,9 @@ class PhotoCard(Card):
         cfg.setdefault("shuffle", True)
         cfg.setdefault("recursive", True)
         cfg.setdefault("caption", True)
-        self.files, self.order, self.pos = [], [], -1
-        self.cur = self.prev = None           # (QImage, путь)
+        cfg.setdefault("kenburns", True)
+        self.files, self.order, self.pos = None, [], -1      # files=None - ещё не искали
+        self.cur = self.prev = None           # Shot
         self.fade_t0 = 0.0
         self.token = 0
         self.loading = False
@@ -862,35 +1710,38 @@ class PhotoCard(Card):
         self._loaded.connect(self._on_loaded)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next)
-        self.anim = QTimer(self)
-        self.anim.timeout.connect(self._anim_step)
         self.rescan = QTimer(self)
         self.rescan.timeout.connect(self.scan)
         self.rescan.start(10 * 60 * 1000)
         self.scan()
 
     # ----- файлы -----
+    def source_key(self):
+        if self.cfg.get("files"):
+            return ("files", tuple(self.cfg["files"]))
+        return ("folder", self.cfg.get("folder"), bool(self.cfg.get("recursive")))
+
     def scan(self):
+        key = self.source_key()
+        files = self.cfg.get("files")
         folder = self.cfg.get("folder")
-        if not folder or not os.path.isdir(folder):
-            if DEMO and not folder:
-                return
-            self.files = []
+        if not files and (not folder or not os.path.isdir(folder)):
+            self.files = [] if folder else None
             self.update()
             return
         rec = bool(self.cfg.get("recursive"))
 
         def work():
-            files = list_images(folder, rec)
+            res = [f for f in files if os.path.isfile(f)] if files else list_images(folder, rec)
             try:
-                self._listed.emit(folder, files)
+                self._listed.emit(key, res)
             except RuntimeError:
                 pass
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_list(self, folder, files):
-        if folder != self.cfg.get("folder"):
+    def _on_list(self, key, files):
+        if key != self.source_key():
             return
         first = not self.files
         cur = self.order[self.pos] if 0 <= self.pos < len(self.order) else None
@@ -902,18 +1753,13 @@ class PhotoCard(Card):
         self._restart_timer()
 
     def _reorder(self, keep=None):
-        self.order = list(self.files)
+        self.order = list(self.files or [])
         if self.cfg.get("shuffle"):
             random.shuffle(self.order)
         self.pos = self.order.index(keep) if keep in self.order else -1
 
     def _restart_timer(self):
         self.timer.start(int(self.cfg.get("interval", 10)) * 1000)
-
-    def target_px(self):
-        r = self.card_rect()
-        dpr = self.devicePixelRatioF() or 1.0
-        return int(r.width() * dpr), int(r.height() * dpr)
 
     def next(self, step=1):
         if not self.order or self.loading:
@@ -928,7 +1774,10 @@ class PhotoCard(Card):
 
     def _load(self, path, instant=False):
         self.token += 1
-        tok, (w, h) = self.token, self.target_px()
+        r = self.card_rect()
+        dpr = self.devicePixelRatioF() or 1.0
+        zmax = KB_ZOOM if self.cfg.get("kenburns") else 1.0
+        tok, w, h = self.token, int(r.width() * dpr * zmax), int(r.height() * dpr * zmax)
         self.loading = True
 
         def work():
@@ -937,7 +1786,7 @@ class PhotoCard(Card):
             except Exception:
                 img = None
             try:
-                self._loaded.emit(tok, (path, instant), img)
+                self._loaded.emit(tok, (path, instant, zmax), img)
             except RuntimeError:                 # виджет уже закрыт
                 pass
 
@@ -947,64 +1796,68 @@ class PhotoCard(Card):
         self.loading = False
         if tok != self.token:
             return
-        path, instant = info
-        if img is None:                        # битый файл - пропускаем
+        path, instant, zmax = info
+        if img is None:                        # битый файл или стикер - пропускаем
             if path in self.order and len(self.order) > 1:
                 i = self.order.index(path)
                 self.order.pop(i)
                 self.pos = i - 1
-                QTimer.singleShot(50, self.next)
+                QTimer.singleShot(30, self.next)
+            elif self.cur is None:
+                self.files = []
+                self.update()
             return
-        img.setDevicePixelRatio(self.devicePixelRatioF() or 1.0)
-        self.prev = None if instant else self.cur
-        self.cur = (img, path)
+        old = self.cur
+        self.cur = Shot(img, path, zmax)
+        if instant and old is not None and old.zmax == zmax:   # та же картинка, другой размер
+            self.cur.t0, self.cur.z0, self.cur.z1, self.cur.c0, self.cur.c1 = old.t0, old.z0, old.z1, old.c0, old.c1
+        self.prev = None if instant or not self.animated else old
         self.fade_t0 = time.time()
-        if self.prev is not None:
-            self.anim.start(16)
-        self.update()
-
-    def _anim_step(self):
-        if time.time() - self.fade_t0 >= self.FADE:
-            self.anim.stop()
-            self.prev = None
         self.update()
 
     def size_changed(self):
         if self.cur is not None:
-            self._load(self.cur[1], instant=True)
+            self._load(self.cur.path, instant=True)
 
     # ----- рисование -----
     def paint(self, p, r, th):
         if self.cur is None:
             self._paint_empty(p, r, th)
             return
-        t = min(1.0, (time.time() - self.fade_t0) / self.FADE) if self.prev else 1.0
-        t = t * t * (3 - 2 * t)                # плавное начало и конец
+        moving = bool(self.cfg.get("kenburns")) and self.animated
+        period = int(self.cfg.get("interval", 10)) + self.FADE * 2
+        t = 1.0
         if self.prev is not None:
-            p.drawImage(r.topLeft(), self.prev[0])
-        p.setOpacity(t)
-        p.drawImage(r.topLeft(), self.cur[0])
-        p.setOpacity(1.0)
+            t = smooth((time.time() - self.fade_t0) / self.FADE)
+            if t >= 1.0:
+                self.prev = None
+            else:
+                self.prev.draw(p, r, period, moving)
+                self.want_frame(16)
+        p.save()
+        p.setOpacity(p.opacity() * t)
+        self.cur.draw(p, r, period, moving)
+        p.restore()
+        if moving:
+            self.want_frame(40)                # медленное движение: 25 кадров в секунду хватает
         if self.cfg.get("caption") and self.cfg["size"] != "s":
             g = QLinearGradient(0, r.bottom() - 70, 0, r.bottom())
             g.setColorAt(0, QColor(0, 0, 0, 0))
             g.setColorAt(1, QColor(0, 0, 0, 120))
             p.fillRect(QRectF(r.x(), r.bottom() - 70, r.width(), 70), g)
-            path = self.cur[1]
+            path = self.cur.path
             try:
                 dt = datetime.datetime.fromtimestamp(os.path.getmtime(path))
                 date = "%d %s %d" % (dt.day, MONTHS_GEN[dt.month - 1], dt.year)
             except Exception:
                 date = ""
             name = os.path.basename(os.path.dirname(path))
-            text(p, QRectF(r.x() + 18, r.bottom() - 46, r.width() - 36, 20), name,
-                 font(14, QFont.Weight.DemiBold), QColor(255, 255, 255),
-                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            text(p, QRectF(r.x() + 18, r.bottom() - 27, r.width() - 36, 18), date,
-                 font(12), QColor(255, 255, 255, 200), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            text(p, QRectF(r.x() + 18, r.bottom() - 46, r.width() - 36, 20), name, font(14, SEMI), WHITE, AL | AVC)
+            text(p, QRectF(r.x() + 18, r.bottom() - 27, r.width() - 36, 18), date, font(12),
+                 QColor(255, 255, 255, 200), AL | AVC)
 
     def _paint_empty(self, p, r, th):
-        cx, cy = r.center().x(), r.center().y() - 16
+        cx, cy = r.center().x(), r.center().y() - 18
         p.save()
         pen = QPen(th["fg2"], 2.2)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1020,35 +1873,73 @@ class PhotoCard(Card):
         p.drawPath(mount)
         p.drawEllipse(QPointF(cx + 11, cy - 9), 4, 4)
         p.restore()
-        folder = self.cfg.get("folder")
-        msg = ("Нет фотографий в папке" if folder and self.files == [] and os.path.isdir(folder)
+        msg = ("В этой папке нет фотографий.\nНажми, чтобы выбрать другую" if self.files == []
                else "Нажми, чтобы выбрать\nпапку с фотографиями")
-        text(p, QRectF(r.x() + 10, cy + 30, r.width() - 20, 40), msg, font(13), th["fg2"], elide=False)
+        p.setFont(font(12))
+        p.setPen(th["fg2"])
+        p.drawText(QRectF(r.x() + 10, cy + 30, r.width() - 20, 44),
+                   int(AC | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
 
-    # ----- действия -----
+    # ----- выбор фото -----
     def clicked(self, pos):
         if self.cur is None:
-            self.choose_folder()
+            self.source_menu().exec(self.mapToGlobal(pos.toPoint()))
 
     def activate(self):
         if self.cur is not None:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.cur[1]))
-        else:
-            self.choose_folder()
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.cur.path))
+
+    def source_menu(self, menu=None):
+        if menu is None:
+            menu = QMenu(self)
+            menu.setStyleSheet(self.mgr.menu_css())
+        for label, path in photo_places():
+            n = count_images(path)
+            title = ("Telegram — " + path) if label == "Telegram" else label
+            title += ("   (%d фото)" % n) if n else "   (пусто)"
+            a = menu.addAction(title)
+            a.setCheckable(True)
+            a.setChecked(not self.cfg.get("files") and
+                         os.path.normcase(self.cfg.get("folder") or "") == os.path.normcase(path))
+            a.triggered.connect(lambda _=False, pth=path: self.set_folder(pth))
+        menu.addSeparator()
+        menu.addAction("Другая папка...").triggered.connect(self.choose_folder)
+        menu.addAction("Выбрать отдельные фото...").triggered.connect(self.choose_files)
+        return menu
+
+    def set_folder(self, folder):
+        self.cfg["folder"] = os.path.normpath(folder)
+        self.cfg.pop("files", None)
+        self._reset_source()
+
+    def _reset_source(self):
+        self.files, self.order, self.pos = None, [], -1
+        self.cur = self.prev = None
+        self.mgr.save()
+        self.update()
+        self.scan()
+
+    def _start_dir(self):
+        return self.cfg.get("folder") or QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.PicturesLocation)
 
     def choose_folder(self):
-        start = self.cfg.get("folder") or os.path.join(os.path.expanduser("~"), "Pictures")
-        d = QFileDialog.getExistingDirectory(None, "Папка с фотографиями", start)
+        d = QFileDialog.getExistingDirectory(
+            None, "Выбери ПАПКУ с фото (сами фото в этом окне не видны - это нормально)", self._start_dir())
         if d:
-            self.cfg["folder"] = os.path.normpath(d)
-            self.files, self.order, self.pos = [], [], -1
-            self.cur = self.prev = None
-            self.mgr.save()
-            self.update()
-            self.scan()
+            self.set_folder(d)
+
+    def choose_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            None, "Выбери фото (можно сразу несколько: Ctrl+A)", self._start_dir(),
+            "Фото (%s);;Все файлы (*)" % " ".join("*" + e for e in sorted(IMG_EXT)))
+        if files:
+            self.cfg["files"] = [os.path.normpath(f) for f in files]
+            self.cfg["folder"] = os.path.dirname(self.cfg["files"][0])
+            self._reset_source()
 
     def extra_menu(self, menu):
-        menu.addAction("Выбрать папку...").triggered.connect(self.choose_folder)
+        self.source_menu(menu.addMenu("Откуда брать фото"))
         if self.cur is not None:
             menu.addAction("Следующее фото").triggered.connect(lambda: (self.next(), self._restart_timer()))
             menu.addAction("Предыдущее фото").triggered.connect(lambda: (self.next(-1), self._restart_timer()))
@@ -1063,6 +1954,7 @@ class PhotoCard(Card):
             grp.addAction(a)
             a.triggered.connect(lambda _=False, s=sec: self._set("interval", s))
         for key, label in (("shuffle", "Случайный порядок"), ("recursive", "Включая подпапки"),
+                           ("kenburns", "Медленное приближение (как на Mac)"),
                            ("caption", "Подпись (папка и дата)")):
             a = menu.addAction(label)
             a.setCheckable(True)
@@ -1073,9 +1965,9 @@ class PhotoCard(Card):
         if self.cur is None:
             return
         if IS_WIN:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(self.cur[1])], creationflags=NO_WINDOW)
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(self.cur.path)], creationflags=NO_WINDOW)
         else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.cur[1])))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.cur.path)))
 
     def _set(self, key, val):
         self.cfg[key] = val
@@ -1083,27 +1975,278 @@ class PhotoCard(Card):
         if key == "interval":
             self._restart_timer()
         elif key == "shuffle":
-            self._reorder(keep=self.cur[1] if self.cur else None)
+            self._reorder(keep=self.cur.path if self.cur else None)
         elif key == "recursive":
             self.scan()
+        elif key == "kenburns":
+            self.size_changed()
         self.update()
 
     def closing(self):
         self.timer.stop()
-        self.anim.stop()
         self.rescan.stop()
+
+
+# ---------------------------------------------------------------------------
+#  Виджет "Погода"
+# ---------------------------------------------------------------------------
+WEATHER_BG = {   # (верх, низ) для дня (1) и ночи (0)
+    ("clear", 1): ("#2F80D8", "#73B6F0"), ("clear", 0): ("#0B1736", "#2A3B66"),
+    ("partly", 1): ("#3B7BC4", "#83AFD9"), ("partly", 0): ("#141F3A", "#34446A"),
+    ("cloudy", 1): ("#5B6E83", "#8EA0B4"), ("cloudy", 0): ("#1E2531", "#3B4555"),
+    ("fog", 1): ("#7D8794", "#AEB6C0"), ("fog", 0): ("#2B3038", "#4A515C"),
+    ("rain", 1): ("#3F5368", "#6A7F94"), ("rain", 0): ("#151C27", "#323D4E"),
+    ("snow", 1): ("#6283AC", "#A7BEDA"), ("snow", 0): ("#1C2840", "#45577A"),
+    ("storm", 1): ("#2A2F45", "#4E5470"), ("storm", 0): ("#12141F", "#2C3045"),
+}
+
+
+class WeatherCard(Card):
+    KIND = "weather"
+    TITLE = "Погода"
+    DEFAULT_SIZE = "m"
+    _got = Signal(object, object)
+
+    def __init__(self, mgr, cfg):
+        super().__init__(mgr, cfg)
+        cfg.setdefault("anim", True)
+        self.data = cfg.get("cache")
+        self.error = None
+        self.busy = False
+        self.parts = []
+        self.parts_kind = None
+        self.flash = 0.0
+        self.t0 = time.time()
+        self._got.connect(self._on_data)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(20 * 60 * 1000)
+        age = time.time() - float(cfg.get("cache_ts", 0) or 0)
+        QTimer.singleShot(200 if age > 15 * 60 or not self.data else 15 * 60 * 1000 - int(age * 1000),
+                          self.refresh)
+
+    # ----- данные -----
+    def refresh(self, relocate=False, city=None):
+        if self.busy:
+            return
+        self.busy = True
+        self.update()
+        cfg = dict(self.cfg)
+
+        def work():
+            res, err = None, None
+            try:
+                if DEMO:
+                    res = ((city or cfg.get("city") or "Москва", 55.75, 37.62), demo_weather())
+                else:
+                    if city:
+                        loc = geocode(city)
+                        if loc is None:
+                            raise LookupError("Город «%s» не найден" % city)
+                    elif relocate or cfg.get("lat") is None:
+                        loc = locate_by_ip() or ("Москва", 55.7558, 37.6173)
+                    else:
+                        loc = (cfg.get("city") or "", float(cfg["lat"]), float(cfg["lon"]))
+                    res = (loc, fetch_weather(loc[1], loc[2]))
+            except LookupError as ex:
+                err = str(ex)
+            except Exception:
+                err = "Нет связи с сервером погоды"
+            try:
+                self._got.emit(res, err)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_data(self, res, err):
+        self.busy = False
+        self.error = err
+        if res is not None:
+            (city, lat, lon), data = res
+            self.cfg.update({"city": city, "lat": lat, "lon": lon, "cache": data, "cache_ts": time.time()})
+            self.data = data
+            self.mgr.save()
+        self.update()
+
+    # ----- фон и частицы -----
+    def wkind(self):
+        if not self.data:
+            return "cloudy", 1
+        return wmo(self.data["code"])[1], int(self.data.get("day", 1))
+
+    def paint_bg(self, p, path, r, th):
+        top, bot = WEATHER_BG.get(self.wkind(), ("#3B7BC4", "#83AFD9"))
+        g = QLinearGradient(r.topLeft(), r.bottomLeft())
+        g.setColorAt(0, QColor(top))
+        g.setColorAt(1, QColor(bot))
+        p.fillPath(path, g)
+
+    def _particles(self, p, r, kind):
+        if kind != self.parts_kind:
+            self.parts_kind = kind
+            heavy = self.data and int(self.data["code"]) in (65, 67, 75, 82, 86, 99)
+            n = {"rain": 70, "storm": 80, "snow": 60}.get(kind, 0)
+            n = int(n * (1.6 if heavy else 1.0) * r.width() * r.height() / (360 * 376) * 1.6)
+            self.parts = [[random.random(), random.random(), random.uniform(0.5, 1.0), random.random()]
+                          for _ in range(n)]
+        if not self.parts:
+            return
+        dt = self._dt
+        p.save()
+        if kind == "snow":
+            p.setPen(NOPEN)
+            ts = time.time()
+            for pt in self.parts:
+                pt[1] += dt * 0.09 * pt[2] * 376 / r.height()
+                pt[0] += dt * 0.02 * math.sin(ts * 1.2 + pt[3] * 6.28)
+                if pt[1] > 1.02:
+                    pt[1], pt[0] = -0.02, random.random()
+                pt[0] %= 1.0
+                rad = 0.8 + 2.0 * pt[2]
+                p.setBrush(QColor(255, 255, 255, int(90 + 140 * pt[2])))
+                p.drawEllipse(QPointF(r.x() + pt[0] * r.width(), r.y() + pt[1] * r.height()), rad, rad)
+        else:
+            for pt in self.parts:
+                pt[1] += dt * 1.1 * pt[2] * 376 / r.height()
+                pt[0] -= dt * 0.12 * pt[2]
+                if pt[1] > 1.05:
+                    pt[1], pt[0] = -0.05, random.uniform(0, 1.15)
+                x, y = r.x() + pt[0] * r.width(), r.y() + pt[1] * r.height()
+                p.setPen(QPen(QColor(200, 225, 255, int(50 + 90 * pt[2])), 1.2))
+                p.drawLine(QPointF(x, y), QPointF(x + 3 * pt[2], y - 12 * pt[2]))
+            if kind == "storm":
+                if self.flash <= 0 and random.random() < dt * 0.25:
+                    self.flash = 1.0
+                if self.flash > 0:
+                    p.fillRect(r, QColor(255, 255, 255, int(110 * self.flash ** 2)))
+                    self.flash -= dt * 3.0
+        p.restore()
+
+    # ----- рисование -----
+    def paint(self, p, r, th):
+        anim = self.animated and self.cfg.get("anim", True)
+        t = (time.time() - self.t0) if anim else 0.0
+        if anim:
+            self.want_frame(33)
+        if not self.data:
+            msg = self.error or "Загружаю погоду..."
+            draw_wicon(p, "cloudy", 1, r.center().x(), r.center().y() - 18, 56, t)
+            text(p, QRectF(r.x() + 10, r.center().y() + 22, r.width() - 20, 22), msg, font(13), WHITE)
+            return
+        d = self.data
+        kind, day = self.wkind()
+        if anim:
+            self._particles(p, r, kind)
+        size = self.cfg["size"]
+        city = self.cfg.get("city") or ""
+        cond = wmo(d["code"])[0]
+        temp = self.av("temp", float(d["temp"]), 5.0, start=float(d["temp"]) - 6)
+        hl = "Макс. %s, мин. %s" % (deg(d["max"]), deg(d["min"])) if d.get("max") is not None else ""
+        soft = QColor(255, 255, 255, 210)
+        if size == "s":
+            text(p, QRectF(r.x() + 16, r.y() + 12, r.width() - 32, 20), city, font(14, SEMI), WHITE, AL | AVC)
+            text(p, QRectF(r.x() + 16, r.y() + 30, r.width() - 32, 54), deg(temp), font(44, LIGHT), WHITE, AL | AVC)
+            draw_wicon(p, kind, day, r.x() + 32, r.y() + 106, 34, t)
+            text(p, QRectF(r.x() + 16, r.y() + 126, r.width() - 32, 18), cond, font(12, SEMI), WHITE, AL | AVC)
+            text(p, QRectF(r.x() + 16, r.y() + 143, r.width() - 32, 16), hl, font(11), soft, AL | AVC)
+            return
+        text(p, QRectF(r.x() + 18, r.y() + 12, r.width() * 0.6, 22), city, font(15, SEMI), WHITE, AL | AVC)
+        text(p, QRectF(r.x() + 18, r.y() + 32, 160, 52), deg(temp), font(44, LIGHT), WHITE, AL | AVC)
+        draw_wicon(p, kind, day, r.right() - 40, r.y() + 34, 36, t)
+        text(p, QRectF(r.right() - 220, r.y() + 56, 202, 18), cond, font(12, SEMI), WHITE, AR | AVC)
+        text(p, QRectF(r.right() - 220, r.y() + 73, 202, 16), hl, font(11), soft, AR | AVC)
+        if self.error:
+            text(p, QRectF(r.x() + 18, r.y() + 82, r.width() - 36, 14), self.error, font(10),
+                 QColor(255, 255, 255, 170), AL | AVC)
+        hours = d.get("hours") or []
+        if hours:
+            top = r.y() + 98
+            p.setPen(QPen(QColor(255, 255, 255, 50), 1))
+            p.drawLine(QPointF(r.x() + 18, top - 4), QPointF(r.right() - 18, top - 4))
+            slot = (r.width() - 24) / len(hours)
+            for i, h in enumerate(hours):
+                cx = r.x() + 12 + slot * (i + 0.5)
+                text(p, QRectF(cx - slot / 2, top, slot, 16), h["label"], font(11, SEMI), soft)
+                draw_wicon(p, wmo(h["code"])[1], h.get("day", 1), cx, top + 30, 22, t + i)
+                text(p, QRectF(cx - slot / 2, top + 44, slot, 18), deg(h["temp"]), font(13, SEMI), WHITE)
+        days = d.get("days") or []
+        if size != "l" or not days:
+            return
+        top = r.y() + 172
+        p.setPen(QPen(QColor(255, 255, 255, 50), 1))
+        p.drawLine(QPointF(r.x() + 18, top - 4), QPointF(r.right() - 18, top - 4))
+        lo = min(x["min"] for x in days)
+        hi = max(x["max"] for x in days)
+        span = max(1.0, hi - lo)
+        row = (r.bottom() - 10 - top) / len(days)
+        for i, x in enumerate(days):
+            y = top + i * row
+            text(p, QRectF(r.x() + 18, y, 70, row), x["label"], font(13, SEMI), WHITE, AL | AVC)
+            draw_wicon(p, wmo(x["code"])[1], 1, r.x() + 106, y + row / 2, 20, t + i * 0.7)
+            text(p, QRectF(r.x() + 124, y, 46, row), deg(x["min"]), font(13), QColor(255, 255, 255, 170), AR | AVC)
+            text(p, QRectF(r.right() - 64, y, 46, row), deg(x["max"]), font(13, SEMI), WHITE, AR | AVC)
+            bar = QRectF(r.x() + 180, y + row / 2 - 2.5, r.right() - 70 - (r.x() + 180), 5)
+            p.setPen(NOPEN)
+            p.setBrush(QColor(0, 0, 0, 50))
+            p.drawRoundedRect(bar, 2.5, 2.5)
+            grow = self.av("bar%d" % i, 1.0, 4.0 + i * 0.4, start=0.0)
+            a = bar.x() + bar.width() * (x["min"] - lo) / span
+            b = bar.x() + bar.width() * (x["max"] - lo) / span
+            b = a + (b - a) * grow
+            g = QLinearGradient(bar.x(), 0, bar.right(), 0)
+            g.setColorAt(0, QColor("#64D2FF"))
+            g.setColorAt(0.5, QColor("#A8E063"))
+            g.setColorAt(1, QColor("#FFB340"))
+            p.setBrush(g)
+            p.drawRoundedRect(QRectF(a, bar.y(), max(5.0, b - a), 5), 2.5, 2.5)
+            if i == 0 and d.get("temp") is not None and lo <= d["temp"] <= hi:
+                cx = bar.x() + bar.width() * (d["temp"] - lo) / span
+                p.setBrush(WHITE)
+                p.setPen(QPen(QColor(0, 0, 0, 60), 1))
+                p.drawEllipse(QPointF(cx, bar.center().y()), 3.5, 3.5)
+
+    # ----- меню -----
+    def extra_menu(self, menu):
+        menu.addAction("Указать город...").triggered.connect(self.ask_city)
+        menu.addAction("Определить место автоматически").triggered.connect(lambda: self.refresh(relocate=True))
+        menu.addAction("Обновить").triggered.connect(lambda: self.refresh())
+        a = menu.addAction("Живой фон (снег, дождь)")
+        a.setCheckable(True)
+        a.setChecked(bool(self.cfg.get("anim", True)))
+        a.toggled.connect(self._set_anim)
+
+    def _set_anim(self, v):
+        self.cfg["anim"] = bool(v)
+        self.mgr.save()
+        self.update()
+
+    def ask_city(self):
+        name, ok = QInputDialog.getText(None, "Погода", "Город (например: Казань, Минск, Алматы):",
+                                        text=self.cfg.get("city") or "")
+        if ok and name.strip():
+            self.refresh(city=name.strip())
+
+    def activate(self):
+        if self.cfg.get("lat") is not None:
+            QDesktopServices.openUrl(QUrl("https://yandex.ru/pogoda/?lat=%.4f&lon=%.4f"
+                                          % (float(self.cfg["lat"]), float(self.cfg["lon"]))))
+
+    def closing(self):
+        self.timer.stop()
 
 
 # ---------------------------------------------------------------------------
 #  Виджет "Часы"
 # ---------------------------------------------------------------------------
-class ClockCard(Card):
+class ClockCard(CalendarMixin, Card):
     KIND = "clock"
-    TITLE = "Часы и календарь"
-    DEFAULT_SIZE = "m"
+    TITLE = "Часы"
+    DEFAULT_SIZE = "s"
 
     def __init__(self, mgr, cfg):
         super().__init__(mgr, cfg)
+        self.cal_init()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update)
         self.timer.start(1000)
@@ -1112,53 +2255,49 @@ class ClockCard(Card):
         now = datetime.datetime.now()
         size = self.cfg["size"]
         if size == "s":
-            self._analog(p, r.center().x(), r.center().y(), 66, now, th)
+            self._analog(p, r.center().x(), r.center().y(), 68, now, th)
         elif size == "m":
-            left = QRectF(r.x() + 20, r.y() + 18, r.width() * 0.48 - 20, r.height() - 36)
-            text(p, QRectF(left.x(), left.y(), left.width(), 18), WEEKDAYS[now.weekday()].upper(),
-                 font(12, QFont.Weight.DemiBold), ACCENT, Qt.AlignmentFlag.AlignLeft)
-            text(p, QRectF(left.x(), left.y() + 16, left.width(), 60), str(now.day),
-                 font(48, QFont.Weight.Light), th["fg"], Qt.AlignmentFlag.AlignLeft)
-            text(p, QRectF(left.x(), left.y() + 82, left.width(), 46), now.strftime("%H:%M"),
-                 font(34, QFont.Weight.DemiBold), th["fg"], Qt.AlignmentFlag.AlignLeft)
-            text(p, QRectF(left.x(), left.y() + 120, left.width(), 18),
-                 "%s %d" % (MONTHS_GEN[now.month - 1], now.year), font(12), th["fg2"], Qt.AlignmentFlag.AlignLeft)
-            self._calendar(p, QRectF(r.x() + r.width() * 0.48, r.y() + 14, r.width() * 0.52 - 16,
-                                     r.height() - 26), now, th, 11)
+            self._analog(p, r.x() + 85, r.center().y(), 64, now, th)
+            tx = r.x() + 170
+            text(p, QRectF(tx, r.y() + 30, r.right() - tx - 16, 48), now.strftime("%H:%M"),
+                 font(40, SEMI), th["fg"], AL | AVC)
+            text(p, QRectF(tx, r.y() + 82, r.right() - tx - 16, 20), WEEKDAYS[now.weekday()],
+                 font(14, SEMI), ACCENT, AL | AVC)
+            text(p, QRectF(tx, r.y() + 102, r.right() - tx - 16, 20),
+                 "%d %s %d" % (now.day, MONTHS_GEN[now.month - 1], now.year), font(13), th["fg2"], AL | AVC)
         else:
             self._analog(p, r.x() + 88, r.y() + 90, 66, now, th)
             tx = r.x() + 176
             text(p, QRectF(tx, r.y() + 36, r.right() - tx - 18, 46), now.strftime("%H:%M"),
-                 font(38, QFont.Weight.DemiBold), th["fg"], Qt.AlignmentFlag.AlignLeft)
+                 font(38, SEMI), th["fg"], AL)
             text(p, QRectF(tx, r.y() + 86, r.right() - tx - 18, 20), WEEKDAYS[now.weekday()],
-                 font(14, QFont.Weight.DemiBold), ACCENT, Qt.AlignmentFlag.AlignLeft)
+                 font(14, SEMI), ACCENT, AL)
             text(p, QRectF(tx, r.y() + 106, r.right() - tx - 18, 20),
-                 "%d %s %d" % (now.day, MONTHS_GEN[now.month - 1], now.year), font(13), th["fg2"],
-                 Qt.AlignmentFlag.AlignLeft)
+                 "%d %s %d" % (now.day, MONTHS_GEN[now.month - 1], now.year), font(13), th["fg2"], AL)
             p.setPen(QPen(th["line"], 1))
-            p.drawLine(QPointF(r.x() + 20, r.y() + 178), QPointF(r.right() - 20, r.y() + 178))
-            self._calendar(p, QRectF(r.x() + 20, r.y() + 188, r.width() - 40, r.height() - 202), now, th, 13)
+            p.drawLine(QPointF(r.x() + 20, r.y() + 176), QPointF(r.right() - 20, r.y() + 176))
+            self.paint_calendar(p, QRectF(r.x() + 20, r.y() + 184, r.width() - 40, r.height() - 196), th, 13)
 
     def _analog(self, p, cx, cy, rad, now, th):
         p.save()
         light = self.mgr.cfg.get("theme") == "light"
         p.setPen(NOPEN)
-        p.setBrush(QColor(255, 255, 255) if not light else QColor(30, 30, 32))
+        p.setBrush(WHITE if not light else QColor(30, 30, 32))
         p.drawEllipse(QPointF(cx, cy), rad, rad)
         ink = QColor(20, 20, 22) if not light else QColor(245, 245, 247)
-        p.setFont(font(rad * 0.24, QFont.Weight.DemiBold))
+        p.setFont(font(rad * 0.22, SEMI))
         p.setPen(ink)
         for h in range(1, 13):
             a = math.radians(h * 30)
-            x, y = cx + math.sin(a) * rad * 0.76, cy - math.cos(a) * rad * 0.76
-            p.drawText(QRectF(x - 14, y - 12, 28, 24), int(Qt.AlignmentFlag.AlignCenter), str(h))
+            x, y = cx + math.sin(a) * rad * 0.72, cy - math.cos(a) * rad * 0.72
+            p.drawText(QRectF(x - 14, y - 12, 28, 24), int(AC), str(h))
+        p.setPen(QPen(QColor(ink.red(), ink.green(), ink.blue(), 90), 1))
         for m in range(60):
             if m % 5:
                 a = math.radians(m * 6)
-                p.setPen(QPen(QColor(ink.red(), ink.green(), ink.blue(), 90), 1))
                 p.drawLine(QPointF(cx + math.sin(a) * rad * 0.9, cy - math.cos(a) * rad * 0.9),
                            QPointF(cx + math.sin(a) * rad * 0.95, cy - math.cos(a) * rad * 0.95))
-        sec = now.second
+        sec = now.second + (now.microsecond / 1e6 if self.animated else 0.0)
         mins = now.minute + sec / 60.0
         hrs = (now.hour % 12) + mins / 60.0
 
@@ -1177,30 +2316,8 @@ class ClockCard(Card):
         p.setBrush(ACCENT)
         p.drawEllipse(QPointF(cx, cy), rad * 0.055, rad * 0.055)
         p.restore()
-
-    def _calendar(self, p, rc, now, th, fs):
-        text(p, QRectF(rc.x(), rc.y(), rc.width(), fs * 1.8), MONTHS[now.month - 1].upper(),
-             font(fs, QFont.Weight.DemiBold), ACCENT, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        weeks = calendar.Calendar(0).monthdayscalendar(now.year, now.month)
-        top = rc.y() + fs * 2.0
-        cw = rc.width() / 7
-        ch = (rc.bottom() - top) / (len(weeks) + 1)
-        for i, wd in enumerate(WD_SHORT):
-            text(p, QRectF(rc.x() + i * cw, top, cw, ch), wd, font(fs * 0.85, QFont.Weight.DemiBold),
-                 th["fg2"] if i < 5 else QColor(255, 69, 58, 170))
-        for wi, week in enumerate(weeks):
-            for i, day in enumerate(week):
-                if not day:
-                    continue
-                cell = QRectF(rc.x() + i * cw, top + (wi + 1) * ch, cw, ch)
-                col = th["fg"] if i < 5 else QColor(255, 105, 97)
-                if day == now.day:
-                    d = min(cw, ch) * 0.92
-                    p.setPen(NOPEN)
-                    p.setBrush(RED)
-                    p.drawEllipse(cell.center(), d / 2, d / 2)
-                    col = QColor(255, 255, 255)
-                text(p, cell, str(day), font(fs, QFont.Weight.DemiBold if day == now.day else QFont.Weight.Normal), col)
+        if self.animated:
+            self.want_frame(50)             # плавная секундная стрелка
 
 
 # ---------------------------------------------------------------------------
@@ -1222,10 +2339,11 @@ class SystemCard(Card):
 
     def items(self):
         s = self.mgr.system
-        return [("ЦП", s.cpu, "%d%%" % s.cpu, BLUE),
-                ("ОЗУ", s.mem[0], "%s/%s ГБ" % (gb(s.mem[1]), gb(s.mem[2])), QColor("#BF5AF2")),
-                ("Диск " + s.disk_name.rstrip("\\"), s.disk[0], "своб. %s ГБ" % gb(s.disk[2] - s.disk[1]),
-                 QColor("#FF9F0A"))]
+        return [("ЦП", self.av("cpu", s.cpu, 4.0, 0.0), "%d%%" % s.cpu, BLUE),
+                ("ОЗУ", self.av("mem", s.mem[0], 4.0, 0.0), "%s/%s ГБ" % (gb(s.mem[1]), gb(s.mem[2])),
+                 QColor("#BF5AF2")),
+                ("Диск " + s.disk_name.rstrip("\\"), self.av("disk", s.disk[0], 4.0, 0.0),
+                 "своб. %s ГБ" % gb(s.disk[2] - s.disk[1]), QColor("#FF9F0A"))]
 
     def paint(self, p, r, th):
         items = self.items()
@@ -1235,19 +2353,18 @@ class SystemCard(Card):
             for (fx, fy), (name, val, _det, col) in zip(pos, items):
                 cx, cy = r.x() + r.width() * fx, r.y() + r.height() * fy
                 draw_ring(p, cx, cy, 30, 6, val / 100.0, col, th["track"])
-                text(p, QRectF(cx - 30, cy - 15, 60, 18), "%d%%" % val, font(13, QFont.Weight.DemiBold), th["fg"])
+                text(p, QRectF(cx - 30, cy - 15, 60, 18), "%d%%" % round(val), font(13, SEMI), th["fg"])
                 text(p, QRectF(cx - 30, cy + 2, 60, 14), name.split()[0], font(10), th["fg2"])
         elif size == "m":
             slot = r.width() / 3
             for i, (name, val, det, col) in enumerate(items):
                 cx = r.x() + slot * (i + 0.5)
                 draw_ring(p, cx, r.y() + 66, 36, 7, val / 100.0, col, th["track"])
-                text(p, QRectF(cx - 36, r.y() + 54, 72, 24), "%d%%" % val, font(17, QFont.Weight.DemiBold), th["fg"])
-                text(p, QRectF(cx - slot / 2, r.y() + 112, slot, 18), name, font(12, QFont.Weight.DemiBold), th["fg"])
+                text(p, QRectF(cx - 36, r.y() + 54, 72, 24), "%d%%" % round(val), font(17, SEMI), th["fg"])
+                text(p, QRectF(cx - slot / 2, r.y() + 112, slot, 18), name, font(12, SEMI), th["fg"])
                 text(p, QRectF(cx - slot / 2 + 4, r.y() + 130, slot - 8, 16), det, font(11), th["fg2"])
         else:
-            text(p, QRectF(r.x() + 20, r.y() + 14, r.width() - 40, 24), "Система",
-                 font(15, QFont.Weight.DemiBold), th["fg"], Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            text(p, QRectF(r.x() + 20, r.y() + 14, r.width() - 40, 24), "Система", font(15, SEMI), th["fg"], AL | AVC)
             gr = QRectF(r.x() + 20, r.y() + 48, r.width() - 40, 110)       # график ЦП
             p.setPen(QPen(th["line"], 1))
             for k in (0.25, 0.5, 0.75):
@@ -1271,20 +2388,18 @@ class SystemCard(Card):
                 p.drawPath(path)
             for i, (name, val, det, col) in enumerate(items):
                 y = r.y() + 180 + i * 62
-                text(p, QRectF(r.x() + 20, y, 160, 20), name, font(13, QFont.Weight.DemiBold), th["fg"],
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                text(p, QRectF(r.x() + 20, y, r.width() - 40, 20), "%d%%" % val, font(14, QFont.Weight.DemiBold),
-                     th["fg"], Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                text(p, QRectF(r.x() + 20, y, 160, 20), name, font(13, SEMI), th["fg"], AL | AVC)
+                text(p, QRectF(r.x() + 20, y, r.width() - 40, 20), "%d%%" % round(val), font(14, SEMI),
+                     th["fg"], AR | AVC)
                 draw_bar(p, QRectF(r.x() + 20, y + 26, r.width() - 40, 8), val / 100.0, col, th["track"])
-                text(p, QRectF(r.x() + 20, y + 38, r.width() - 40, 16), det, font(11), th["fg2"],
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                text(p, QRectF(r.x() + 20, y + 38, r.width() - 40, 16), det, font(11), th["fg2"], AL | AVC)
 
     def activate(self):
         if IS_WIN:
             subprocess.Popen(["taskmgr"], creationflags=NO_WINDOW)
 
 
-KINDS = {c.KIND: c for c in (BatteryCard, PhotoCard, ClockCard, SystemCard)}
+KINDS = {c.KIND: c for c in (WeatherCard, BatteryCard, PhotoCard, CalendarCard, ClockCard, SystemCard)}
 
 
 # ---------------------------------------------------------------------------
@@ -1386,8 +2501,10 @@ class Manager(QObject):
         first = not self.cfg.get("widgets")
         if first:
             self.cfg["widgets"] = self.default_layout()
-        for wc in list(self.cfg["widgets"]):
-            self._create(wc)
+        for i, wc in enumerate(list(self.cfg["widgets"])):
+            card = self._create(wc)
+            if card is not None:
+                card.appear(0.15 + i * 0.09)            # виджеты появляются по очереди
         if first:
             self.save()
         if IS_WIN:                                # показ рабочего стола (Win+D, "Свернуть всё")
@@ -1408,7 +2525,7 @@ class Manager(QObject):
                 return data
         except Exception:
             pass
-        return {"theme": "dark", "locked": False, "widgets": []}
+        return {"theme": "dark", "locked": False, "animations": True, "widgets": []}
 
     def save(self):
         self._save_timer.start(500)
@@ -1424,15 +2541,26 @@ class Manager(QObject):
 
     def default_layout(self):
         a = QApplication.primaryScreen().availableGeometry()
-        right = a.right() - 24 - MARGIN
-        x_m = right - SIZES["m"][0] + 1
+        x_m = a.right() - 24 - MARGIN - SIZES["m"][0] + 1
         y = a.top() + 24 - MARGIN
         out = []
-        for kind, size in (("clock", "m"), ("battery", "m"), ("photos", "l")):
-            out.append({"id": "%s-%d" % (kind, len(out)), "kind": kind, "size": size,
-                        "x": x_m, "y": y})
+        for kind, size in (("weather", "m"), ("battery", "m"), ("photos", "l")):
+            wc = {"id": "%s-%d" % (kind, len(out)), "kind": kind, "size": size, "x": x_m, "y": y}
+            if kind == "photos":
+                wc["folder"] = self.auto_photo_folder()
+            out.append(wc)
             y += SIZES[size][1] + 16
         return out
+
+    @staticmethod
+    def auto_photo_folder():
+        """Первая папка с фото: Telegram Desktop, Изображения, OneDrive."""
+        for label, path in photo_places():
+            if label in ("Загрузки", "Рабочий стол"):
+                continue
+            if count_images(path):
+                return path
+        return None
 
     def _create(self, wc):
         cls = KINDS.get(wc.get("kind"))
@@ -1453,11 +2581,13 @@ class Manager(QObject):
               "size": cls.DEFAULT_SIZE,
               "x": a.center().x() - w // 2 - MARGIN + (n % 5) * 24,
               "y": a.center().y() - h // 2 - MARGIN + (n % 5) * 24}
+        if kind == "photos":
+            wc["folder"] = self.auto_photo_folder()
         self.cfg["widgets"].append(wc)
         card = self._create(wc)
+        if card is not None:
+            card.appear()
         self.save()
-        if kind == "photos" and card is not None:
-            QTimer.singleShot(200, card.choose_folder)
 
     def remove(self, card):
         card.closing()
@@ -1465,9 +2595,13 @@ class Manager(QObject):
             self.cfg["widgets"].remove(card.cfg)
         if card in self.cards:
             self.cards.remove(card)
-        card.close()
-        card.deleteLater()
         self.save()
+
+        def dead():
+            card.close()
+            card.deleteLater()
+
+        card.vanish(dead)
 
     def set_theme(self, name):
         self.cfg["theme"] = name
@@ -1475,8 +2609,10 @@ class Manager(QObject):
             c.update()
         self.save()
 
-    def set_locked(self, on):
-        self.cfg["locked"] = bool(on)
+    def set_flag(self, key, on):
+        self.cfg[key] = bool(on)
+        for c in self.cards:
+            c.update()
         self.save()
 
     def menu_css(self):
@@ -1499,10 +2635,15 @@ class Manager(QObject):
             a.setChecked(self.cfg.get("theme") == key)
             grp.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self.set_theme(k))
+        th.addSeparator()
+        a = th.addAction("Анимации")
+        a.setCheckable(True)
+        a.setChecked(bool(self.cfg.get("animations", True)))
+        a.toggled.connect(lambda v: self.set_flag("animations", v))
         a = menu.addAction("Закрепить виджеты (не двигать)")
         a.setCheckable(True)
         a.setChecked(bool(self.cfg.get("locked")))
-        a.toggled.connect(self.set_locked)
+        a.toggled.connect(lambda v: self.set_flag("locked", v))
 
     # ----- низкий заряд -----
     def check_low(self):

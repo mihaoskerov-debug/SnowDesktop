@@ -7,6 +7,7 @@
   * Фото        - слайд-шоу фотографий из папки (например, из "Загрузки\\Telegram Desktop").
   * Календарь   - листается стрелками и колёсиком мыши, праздники РФ.
   * Часы        - аналоговые часы с плавной секундной стрелкой.
+  * Яндекс Музыка - что играет: крутящаяся пластинка, "волна" в такт музыке, кнопки управления.
   * Система     - загрузка процессора, памяти и диска.
 
 Запуск: двойной клик по widgets.pyw (нужен Python 3.9+, PySide6 поставится сам).
@@ -14,7 +15,6 @@
 Виджет: перетаскивай левой кнопкой, правая кнопка - размер и настройки, двойной клик - действие.
 Данные: %APPDATA%\\SnowWidgets\\widgets.json
 """
-import base64
 import calendar
 import ctypes
 import datetime
@@ -29,13 +29,12 @@ import sys
 import threading
 import time
 import traceback
-import urllib.error
 import urllib.parse
 import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -96,9 +95,9 @@ from PySide6.QtCore import (QObject, QPointF, QRectF, QStandardPaths, Qt,  # noq
                             QTimer, QUrl, Signal)
 from PySide6.QtGui import (QActionGroup, QColor, QDesktopServices, QFont,  # noqa: E402
                            QIcon, QImage, QImageReader, QLinearGradient, QPainter,
-                           QPainterPath, QPalette, QPen, QPixmap, QRadialGradient)
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QInputDialog, QLineEdit,  # noqa: E402
-                               QMenu, QSystemTrayIcon, QTextBrowser, QWidget)
+                           QPainterPath, QPen, QPixmap, QRadialGradient, QConicalGradient)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMenu,  # noqa: E402
+                               QSystemTrayIcon, QWidget)
 
 RH = (QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
       | QPainter.RenderHint.TextAntialiasing)
@@ -166,8 +165,7 @@ STYLES = {
 KIND_COLORS = {"battery": ("#2BC48A", "#0B8C8F"), "calendar": ("#FF6A5C", "#F29A3E"),
                "clock": ("#5B5BD6", "#A35BE0"), "system": ("#2D7FF9", "#2EC0EE"),
                "photos": ("#3A3A44", "#1E1E26"), "weather": ("#3B7BC4", "#83AFD9"),
-               "music": ("#F2B705", "#E06A1B"), "claude": ("#D97757", "#A8553A"),
-               "discord": ("#5865F2", "#4248C9"), "notify": ("#5865F2", "#4248C9")}
+               "music": ("#F2B705", "#E06A1B")}
 OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
 
 
@@ -2672,10 +2670,10 @@ class SystemCard(Card):
 
 
 # ---------------------------------------------------------------------------
-#  Общие мелочи для новых виджетов: открыть программу, хранить ключ, кнопки плеера
+#  Общие мелочи для виджета музыки: открыть программу, доставить библиотеку, кнопки плеера
 # ---------------------------------------------------------------------------
 def open_target(*targets):
-    """Открыть первую сработавшую цель: протокол программы (discord://, yandexmusic://) или ссылку."""
+    """Открыть первую сработавшую цель: протокол программы (yandexmusic://) или ссылку."""
     for t in targets:
         try:
             if IS_WIN and "://" in t and not t.startswith("http"):
@@ -2690,50 +2688,6 @@ def open_target(*targets):
         except Exception:
             continue
     return False
-
-
-if IS_WIN:
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-
-def secret_protect(text):
-    """Шифруем ключ средствами Windows (DPAPI): расшифровать сможет только этот пользователь на этом ПК."""
-    raw = text.encode("utf-8")
-    if IS_WIN:
-        try:
-            buf = ctypes.create_string_buffer(raw, len(raw))
-            inp = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-            out = DATA_BLOB()
-            if ctypes.windll.crypt32.CryptProtectData(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
-                data = ctypes.string_at(out.pbData, out.cbData)
-                ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
-                return "dpapi:" + base64.b64encode(data).decode()
-        except Exception:
-            pass
-    return "b64:" + base64.b64encode(raw).decode()
-
-
-def secret_reveal(s):
-    if not s:
-        return ""
-    try:
-        kind, data = s.split(":", 1)
-        raw = base64.b64decode(data)
-        if kind == "b64":
-            return raw.decode("utf-8")
-        if kind == "dpapi" and IS_WIN:
-            buf = ctypes.create_string_buffer(raw, len(raw))
-            inp = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-            out = DATA_BLOB()
-            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(inp), None, None, None, None, 0,
-                                                        ctypes.byref(out)):
-                res = ctypes.string_at(out.pbData, out.cbData)
-                ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
-                return res.decode("utf-8")
-    except Exception:
-        pass
-    return ""
 
 
 def pip_install(*pkgs):
@@ -2795,26 +2749,6 @@ def draw_note(p, cx, cy, s, color):
     path.lineTo(cx - s * 0.06, cy - s * 0.2)
     path.closeSubpath()
     p.drawPath(path)
-    p.restore()
-
-
-def draw_bubble(p, cx, cy, s, color, dots=True):
-    """Облачко чата."""
-    p.save()
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(cx - s * 0.48, cy - s * 0.38, s * 0.96, s * 0.66), s * 0.2, s * 0.2)
-    tail = QPainterPath()
-    tail.moveTo(cx - s * 0.22, cy + s * 0.22)
-    tail.lineTo(cx - s * 0.3, cy + s * 0.46)
-    tail.lineTo(cx, cy + s * 0.24)
-    tail.closeSubpath()
-    p.setPen(NOPEN)
-    p.setBrush(color)
-    p.drawPath(path.united(tail))
-    if dots:
-        p.setBrush(QColor(0, 0, 0, 110))
-        for k in (-1, 0, 1):
-            p.drawEllipse(QPointF(cx + k * s * 0.22, cy - s * 0.05), s * 0.065, s * 0.065)
     p.restore()
 
 
@@ -3126,6 +3060,52 @@ class MediaService(QObject):
 
 
 YA_YELLOW = QColor("#FFD83D")
+YA_ORANGE = QColor("#FF8A3D")
+
+
+class AudioMeter:
+    """Насколько громко сейчас играет звук (пиковый уровень из Windows) - чтобы "волна" прыгала в такт."""
+
+    def __init__(self):
+        self.meter = None
+        self.next_try = 0.0
+        self.installing = False
+
+    def _init(self):
+        self.next_try = time.time() + 20.0                # заново подключаемся раз в 20 с (смена наушников и т.п.)
+        self.meter = None
+        if not IS_WIN or DEMO:
+            return
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+            from comtypes import CLSCTX_ALL
+        except ImportError:
+            if not self.installing:
+                self.installing = True
+                threading.Thread(target=lambda: pip_install("pycaw"), daemon=True).start()
+            return
+        try:
+            dev = AudioUtilities.GetSpeakers()
+            imm = getattr(dev, "_dev", dev)
+            iface = imm.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
+            self.meter = ctypes.cast(iface, ctypes.POINTER(IAudioMeterInformation))
+        except Exception:
+            self.meter = None
+
+    def peak(self):
+        """0..1 или None, если узнать нельзя."""
+        if time.time() >= self.next_try:
+            self._init()
+        if self.meter is None:
+            return None
+        try:
+            return clamp(float(self.meter.GetPeakValue()))
+        except Exception:
+            self.meter = None
+            return None
+
+
+_METER = AudioMeter()
 
 
 class MusicCard(Card):
@@ -3139,81 +3119,251 @@ class MusicCard(Card):
         self.media.updated.connect(self._changed)
         self._seek_to = 0.0
         self.cover_key = None
-        self.blur = None
-        self.prev_blur = None
+        self.cover = None
+        self.label = None
+        self.blur = self.prev_blur = None
+        self.dom = QColor(YA_YELLOW)
         self.fade_t0 = 0.0
+        self.track_t0 = 0.0
+        self.angle = 0.0
+        self.level = 0.0
+        self.bars = []
+        self.shape = []
+        self._changed()
 
+    # ----- данные трека -----
     def _changed(self):
         st = self.media.state
         key = (st or {}).get("key")
         if key != self.cover_key:
             self.cover_key = key
+            self.cover = (st or {}).get("cover")
             self.prev_blur = self.blur
-            self.blur = self._make_blur()
+            self._prepare()
             self.fade_t0 = time.time() if self.animated else 0.0
+            self.track_t0 = self.fade_t0
+            rnd = random.Random(str(key))                  # "форма волны" у каждого трека своя
+            self.shape = [0.45 + 0.55 * (0.5 + 0.5 * math.sin(i * 0.37 + rnd.random() * 6)) * rnd.uniform(0.6, 1.0)
+                          for i in range(120)]
         self.update()
 
-    def _make_blur(self):
-        st = self.media.state
-        img = (st or {}).get("cover")
+    def _prepare(self):
         r = self.card_rect()
-        return blur_image(img, int(r.width()), int(r.height()), 10) if img is not None else None
+        img = self.cover
+        if img is not None and not img.isNull():
+            self.blur = blur_image(img, int(r.width() * 1.15), int(r.height() * 1.15), 10)
+            side = min(img.width(), img.height())
+            sq = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
+            self.label = sq.scaled(160, 160, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            avg = sq.scaled(1, 1, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            c = QColor(avg.pixel(0, 0))
+            h, s, v, _a = c.getHsv()
+            self.dom = QColor.fromHsv(max(0, h), max(90, s), max(200, v))     # яркий вариант цвета обложки
+        else:
+            self.blur = None
+            self.label = None
+            self.dom = QColor(YA_YELLOW)
 
     def size_changed(self):
-        self.blur = self._make_blur()
+        self._prepare()
         self.prev_blur = None
 
+    # ----- живые величины: громкость, вращение -----
+    def _tick(self, playing):
+        t = time.time()
+        peak = _METER.peak() if playing else 0.0
+        if peak is None:                                    # нет данных о звуке - мягкий "ритм" ~120 уд/мин
+            beat = max(0.0, math.sin(t * math.tau * 1.95)) ** 4
+            peak = 0.38 + 0.42 * beat + 0.08 * math.sin(t * 7.3) + 0.05 * math.sin(t * 13.1)
+        target = clamp(peak * 1.15) if playing else 0.0
+        k = 1.0 - math.exp(-self._dt * (22.0 if target > self.level else 5.0))   # быстрый взлёт, плавный спад
+        self.level += (target - self.level) * k
+        spin = self.av("spin", 150.0 if playing else 0.0, 2.2)                     # градусов в секунду
+        self.angle = (self.angle + spin * self._dt) % 360.0
+        slide = self.av("slide", 1.0 if playing else 0.0, 3.5)
+        if playing or spin > 0.5 or self.level > 0.01:
+            self.want_frame(33)
+        return slide
+
+    # ----- фон -----
     def paint_bg(self, p, path, r, th):
         g = QLinearGradient(r.topLeft(), r.bottomRight())
-        g.setColorAt(0, QColor(48, 44, 30))
-        g.setColorAt(1, QColor(16, 16, 18))
+        g.setColorAt(0, QColor(46, 40, 26))
+        g.setColorAt(1, QColor(14, 14, 16))
         p.fillPath(path, g)
-        e = ease_out_cubic((time.time() - self.fade_t0) / 0.6) if self.fade_t0 else 1.0
+        t = time.time()
+        e = ease_out_cubic((t - self.fade_t0) / 0.8) if self.fade_t0 else 1.0
         if e < 1.0:
             self.want_frame(16)
-            if self.prev_blur is not None:
-                p.drawImage(r.topLeft(), self.prev_blur)
-        if self.blur is not None:
-            p.save()
-            p.setOpacity(p.opacity() * e)
-            p.drawImage(r.topLeft(), self.blur)
-            p.restore()
-        p.fillPath(path, QColor(0, 0, 0, 115))
+        playing = bool((self.media.state or {}).get("playing")) and self.animated
 
-    def _cover(self, p, rc, img, radius=12):
+        def draw_blur(img, op):
+            if img is None:
+                return
+            dx = math.sin(t * 0.11) * 0.06 * r.width() if playing else 0.0      # фон медленно плывёт
+            dy = math.cos(t * 0.09) * 0.06 * r.height() if playing else 0.0
+            p.save()
+            p.setOpacity(p.opacity() * op)
+            p.drawImage(QPointF(r.x() - (img.width() - r.width()) / 2 + dx,
+                                r.y() - (img.height() - r.height()) / 2 + dy), img)
+            p.restore()
+
+        if e < 1.0:
+            draw_blur(self.prev_blur, 1.0)
+        draw_blur(self.blur, e)
+        p.fillPath(path, QColor(0, 0, 0, 120))
+
+    # ----- элементы -----
+    def _glow(self, p, cx, cy, rad):
+        c = QColor(self.dom)
+        g = QRadialGradient(QPointF(cx, cy), rad)
+        c.setAlpha(int(40 + 120 * self.level))
+        g.setColorAt(0, c)
+        c2 = QColor(self.dom)
+        c2.setAlpha(0)
+        g.setColorAt(1, c2)
         p.save()
         p.setPen(NOPEN)
-        for i in range(6, 0, -2):
-            p.setBrush(QColor(0, 0, 0, 18))
-            p.drawRoundedRect(rc.adjusted(-i * 0.3, -i * 0.1, i * 0.3, i * 0.6), radius + i * 0.3, radius + i * 0.3)
+        p.setBrush(g)
+        k = 1.0 + 0.12 * self.level
+        p.drawEllipse(QPointF(cx, cy), rad * k, rad * k)
+        p.restore()
+
+    def _vinyl(self, p, cx, cy, R, label=True):
+        p.save()
+        p.setPen(NOPEN)
+        p.setBrush(QColor(0, 0, 0, 110))
+        p.drawEllipse(QPointF(cx + 2, cy + 4), R, R)
+        g = QRadialGradient(QPointF(cx, cy), R)
+        g.setColorAt(0.0, QColor("#202022"))
+        g.setColorAt(0.96, QColor("#0c0c0d"))
+        g.setColorAt(1.0, QColor("#2c2c2e"))
+        p.setBrush(g)
+        p.drawEllipse(QPointF(cx, cy), R, R)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        n = max(6, int(R / 4))
+        for k in range(n):                                   # бороздки
+            rr = R * (0.42 + 0.55 * k / n)
+            p.setPen(QPen(QColor(255, 255, 255, 14 + (10 if k % 3 == 0 else 0)), 0.8))
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        p.translate(cx, cy)
+        p.rotate(self.angle)
+        lr = R * 0.36
+        if label:                                           # "яблоко" пластинки - обложка, крутится
+            lp = QPainterPath()
+            lp.addEllipse(QPointF(0, 0), lr, lr)
+            p.save()
+            p.setClipPath(lp, Qt.ClipOperation.IntersectClip)
+            if self.label is not None:
+                p.drawImage(QRectF(-lr, -lr, 2 * lr, 2 * lr), self.label)
+            else:
+                lg = QLinearGradient(-lr, -lr, lr, lr)
+                lg.setColorAt(0, YA_YELLOW)
+                lg.setColorAt(1, YA_ORANGE)
+                p.fillRect(QRectF(-lr, -lr, 2 * lr, 2 * lr), lg)
+            p.restore()
+            p.setPen(QPen(QColor(0, 0, 0, 120), 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(0, 0), lr, lr)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1.4))       # метка - видно, что пластинка крутится
+        p.drawLine(QPointF(lr + 3, 0), QPointF(R * 0.9, 0))
+        p.rotate(-self.angle)
+        ring = QPainterPath()                               # неподвижный блик (свет падает с одной стороны)
+        ring.addEllipse(QPointF(0, 0), R * 0.98, R * 0.98)
+        inner = QPainterPath()
+        inner.addEllipse(QPointF(0, 0), lr + 2, lr + 2)
+        cg = QConicalGradient(QPointF(0, 0), 40)
+        clear = QColor(255, 255, 255, 0)
+        for pos, a in ((0.0, 0), (0.05, 46), (0.1, 0), (0.5, 0), (0.55, 30), (0.6, 0), (1.0, 0)):
+            c = QColor(255, 255, 255, a) if a else clear
+            cg.setColorAt(pos, c)
+        p.setPen(NOPEN)
+        p.setBrush(cg)
+        p.drawPath(ring.subtracted(inner))
+        p.setBrush(QColor("#d9d9d9"))
+        p.drawEllipse(QPointF(0, 0), max(1.6, R * 0.04), max(1.6, R * 0.04))
+        p.restore()
+
+    def _sleeve(self, p, rc, radius=10):
+        p.save()
+        p.setPen(NOPEN)
+        for i in range(8, 0, -2):
+            p.setBrush(QColor(0, 0, 0, 16))
+            p.drawRoundedRect(rc.adjusted(-i * 0.3, -i * 0.1, i * 0.3, i * 0.7), radius + i * 0.3, radius + i * 0.3)
         path = QPainterPath()
         path.addRoundedRect(rc, radius, radius)
         p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        img = self.cover
         if img is not None and not img.isNull():
             k = max(rc.width() / img.width(), rc.height() / img.height())
             w, h = img.width() * k, img.height() * k
             p.drawImage(QRectF(rc.center().x() - w / 2, rc.center().y() - h / 2, w, h), img)
         else:
             g = QLinearGradient(rc.topLeft(), rc.bottomRight())
-            g.setColorAt(0, QColor("#FFD83D"))
-            g.setColorAt(1, QColor("#FF8A3D"))
+            g.setColorAt(0, YA_YELLOW)
+            g.setColorAt(1, YA_ORANGE)
             p.fillRect(rc, g)
-            draw_note(p, rc.center().x(), rc.center().y(), rc.width() * 0.45, QColor(30, 20, 0, 200))
+            draw_note(p, rc.center().x(), rc.center().y(), rc.width() * 0.42, QColor(40, 24, 0, 200))
+        hl = QLinearGradient(rc.topLeft(), rc.bottomLeft())  # лёгкий глянец сверху
+        hl.setColorAt(0, QColor(255, 255, 255, 40))
+        hl.setColorAt(0.35, QColor(255, 255, 255, 0))
+        p.fillRect(rc, hl)
         p.restore()
 
-    def _eq(self, p, x, y, h, playing):
-        """Маленький "эквалайзер" - прыгающие полоски, пока играет музыка."""
+    def _record(self, p, cover, R, slide_max, slide):
+        """Обложка-конверт, из которой выезжает крутящаяся пластинка."""
+        cx = cover.center().x() + slide_max * smooth(slide)
+        cy = cover.center().y()
+        self._glow(p, cover.center().x() + slide_max * 0.5, cy, cover.width() * 0.95)
+        self._vinyl(p, cx, cy, R)
+        self._sleeve(p, cover, 10 if cover.width() < 150 else 14)
+
+    def _wave(self, p, rc, st):
+        """Прогресс в виде "волны": проигранная часть жёлтая, столбики прыгают в такт."""
+        dur = st["dur"]
+        frac = self.media.position() / dur if dur > 0 else 0.0
+        n = max(8, int(rc.width() / 5))
+        if len(self.bars) != n:
+            self.bars = [0.3] * n
         t = time.time()
+        playing = st["playing"] and self.animated
+        mid = rc.center().y()
+        played = QLinearGradient(rc.x(), 0, rc.right(), 0)
+        played.setColorAt(0, YA_YELLOW)
+        played.setColorAt(1, YA_ORANGE)
         p.save()
-        p.setPen(NOPEN)
-        p.setBrush(YA_YELLOW)
-        for i in range(3):
-            k = (0.35 + 0.65 * abs(math.sin(t * (5.0 + i * 1.7) + i))) if playing and self.animated else 0.35
-            bh = h * k
-            p.drawRoundedRect(QRectF(x + i * 4.5, y + h - bh, 3, bh), 1.2, 1.2)
+        for i in range(n):
+            base = self.shape[i % len(self.shape)] if self.shape else 0.5
+            if playing:
+                wob = 0.5 + 0.5 * math.sin(t * (3.1 + (i % 7) * 0.9) + i * 1.7)
+                target = base * (0.3 + 0.7 * min(1.0, self.level * 1.25) * (0.55 + 0.45 * wob))
+            else:
+                target = base * 0.35
+            k = 1.0 - math.exp(-self._dt * (18.0 if target > self.bars[i] else 7.0))
+            self.bars[i] += (target - self.bars[i]) * k
+            h = max(2.0, rc.height() * self.bars[i])
+            x = rc.x() + i * rc.width() / n
+            bar = QRectF(x, mid - h / 2, 3.0, h)
+            p.setPen(NOPEN)
+            if (i + 0.5) / n <= frac:
+                p.setBrush(played)
+            else:
+                p.setBrush(QColor(255, 255, 255, 70))
+            p.drawRoundedRect(bar, 1.5, 1.5)
         p.restore()
-        if playing and self.animated:
-            self.want_frame(60)
+        if dur > 0:
+            self.hit(QRectF(rc.x(), rc.y() - 4, rc.width(), rc.height() + 8),
+                     lambda: self.media.command("seek", self._seek_to))
+
+    def _times(self, p, rc, st):
+        dur = st["dur"]
+        if dur <= 0:
+            return
+        pos = self.media.position()
+        soft = QColor(255, 255, 255, 170)
+        text(p, QRectF(rc.x(), rc.y(), 60, 14), fmt_time(pos), font(10), soft, AL)
+        text(p, QRectF(rc.right() - 60, rc.y(), 60, 14), "-" + fmt_time(dur - pos), font(10), soft, AR)
 
     def _controls(self, p, cx, cy, size, gap):
         playing = bool((self.media.state or {}).get("playing"))
@@ -3221,100 +3371,95 @@ class MusicCard(Card):
             s = size * sc
             rc = QRectF(cx + dx - s * 0.75, cy - s * 0.75, s * 1.5, s * 1.5)
             if name == "toggle":
+                pulse = 1.0 + 0.06 * self.level if playing else 1.0
                 p.setPen(NOPEN)
-                p.setBrush(QColor(255, 255, 255, 235))
-                p.drawEllipse(rc.center(), s * 0.72, s * 0.72)
+                p.setBrush(QColor(255, 255, 255, 240))
+                p.drawEllipse(rc.center(), s * 0.72 * pulse, s * 0.72 * pulse)
                 draw_media_icon(p, "pause" if playing else "play", rc.center().x() + (0 if playing else s * 0.05),
                                 rc.center().y(), s * 0.62, QColor(20, 20, 22))
             else:
                 draw_media_icon(p, name, rc.center().x(), rc.center().y(), s * 0.62, WHITE)
             self.hit(rc, lambda n=name: self.media.command(n))
 
-    def _progress(self, p, rc, st):
-        dur = st["dur"]
-        pos = self.media.position()
-        draw_bar(p, QRectF(rc.x(), rc.y(), rc.width(), 4), pos / dur if dur > 0 else 0.0, WHITE,
-                 QColor(255, 255, 255, 60))
-        if dur > 0:
-            text(p, QRectF(rc.x(), rc.y() + 7, 60, 14), fmt_time(pos), font(10), QColor(255, 255, 255, 170), AL)
-            text(p, QRectF(rc.right() - 60, rc.y() + 7, 60, 14), "-" + fmt_time(dur - pos), font(10),
-                 QColor(255, 255, 255, 170), AR)
-            self.hit(QRectF(rc.x(), rc.y() - 6, rc.width(), 16),
-                     lambda: self.media.command("seek", self._seek_to))
-        if st["playing"]:
-            self.want_frame(500)
+    def _titles(self, p, rc_title, rc_artist, st, align):
+        k = ease_out_cubic((time.time() - self.track_t0) / 0.6) if self.track_t0 else 1.0
+        if k < 1.0:
+            self.want_frame(16)
+        p.save()
+        p.setOpacity(p.opacity() * k)
+        p.translate((1 - k) * 14, 0)                         # новый трек мягко "въезжает"
+        text(p, rc_title, st["title"], font(rc_title.height() * 0.68, SEMI), WHITE, align)
+        text(p, rc_artist, st["artist"], font(rc_artist.height() * 0.68), QColor(255, 255, 255, 190), align)
+        p.restore()
 
+    # ----- мышь -----
     def mousePressEvent(self, ev):
-        r = self.card_rect()
-        self._seek_to = 0.0
         st = self.media.state
+        self._seek_to = 0.0
         if st and st["dur"] > 0:
-            x0, w = self._bar_geom(r)
+            x0, w = self._wave_geom(self.card_rect())
             self._seek_to = clamp((ev.position().x() - x0) / max(1.0, w)) * st["dur"]
         super().mousePressEvent(ev)
 
-    def _bar_geom(self, r):
-        size = self.cfg["size"]
-        if size == "m":
-            return r.x() + 166, r.right() - 18 - (r.x() + 166)
+    def _wave_geom(self, r):
+        if self.cfg["size"] == "m":
+            return r.x() + 198, r.right() - 16 - (r.x() + 198)
         return r.x() + 24, r.width() - 48
 
+    # ----- рисование -----
     def paint(self, p, r, th):
         st = self.media.state
         size = self.cfg["size"]
+        playing = bool(st and st.get("title") and st["playing"])
+        slide = self._tick(playing)
         if not st or not st.get("title"):
-            draw_note(p, r.center().x(), r.y() + r.height() * 0.32, 34 if size != "s" else 30, YA_YELLOW)
+            R = 40 if size != "s" else 36
+            cy = r.y() + (r.height() * 0.34 if size != "l" else 120)
+            self._vinyl(p, r.center().x(), cy, R, label=True)
             msg = self.media.error or "Ничего не играет"
-            text(p, QRectF(r.x() + 12, r.y() + r.height() * 0.48, r.width() - 24, 20), msg, font(13, SEMI), WHITE)
-            pill = QRectF(r.center().x() - 90, r.y() + r.height() * 0.48 + 28, 180, 30)
-            if size == "s":
-                pill = QRectF(r.x() + 16, r.bottom() - 46, r.width() - 32, 30)
-            p.setPen(NOPEN)
-            p.setBrush(YA_YELLOW)
-            p.drawRoundedRect(pill, 15, 15)
-            text(p, pill, "Открыть Яндекс Музыку" if size != "s" else "Открыть", font(12, SEMI), QColor(20, 20, 20))
-            self.hit(pill, self.activate)
+            text(p, QRectF(r.x() + 12, cy + R + 10, r.width() - 24, 20), msg, font(13, SEMI), WHITE)
+            pill = QRectF(r.center().x() - 90, cy + R + 38, 180, 30) if size != "s" else \
+                QRectF(r.x() + 16, r.bottom() - 40, r.width() - 32, 28)
+            if pill.bottom() <= r.bottom() - 4:
+                p.setPen(NOPEN)
+                p.setBrush(YA_YELLOW)
+                p.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+                text(p, pill, "Открыть Яндекс Музыку" if size != "s" else "Открыть", font(12, SEMI), QColor(20, 20, 20))
+                self.hit(pill, self.activate)
             return
-        cover = st.get("cover")
         src = app_title(st.get("app"))
         if size == "s":
-            self._cover(p, QRectF(r.x(), r.y(), r.width(), r.height()), cover, RADIUS)
-            g = QLinearGradient(0, r.y() + 50, 0, r.bottom())
-            g.setColorAt(0, QColor(0, 0, 0, 0))
-            g.setColorAt(1, QColor(0, 0, 0, 200))
-            p.fillRect(r, g)
-            text(p, QRectF(r.x() + 14, r.bottom() - 56, r.width() - 64, 20), st["title"], font(13, SEMI), WHITE, AL | AVC)
-            text(p, QRectF(r.x() + 14, r.bottom() - 37, r.width() - 64, 18), st["artist"], font(11),
-                 QColor(255, 255, 255, 200), AL | AVC)
-            playing = st["playing"]
-            pc = QRectF(r.right() - 50, r.bottom() - 52, 38, 38)
-            p.setPen(NOPEN)
-            p.setBrush(YA_YELLOW)
-            p.drawEllipse(pc)
-            draw_media_icon(p, "pause" if playing else "play", pc.center().x() + (0 if playing else 1.5),
-                            pc.center().y(), 15, QColor(20, 20, 20))
-            self.hit(pc, lambda: self.media.command("toggle"))
-            self._eq(p, r.x() + 14, r.y() + 14, 12, playing)
+            cx, cy = r.center().x(), r.y() + 68
+            self._glow(p, cx, cy, 80)
+            self._vinyl(p, cx, cy, 52)
+            self.hit(QRectF(cx - 52, cy - 52, 104, 104), lambda: self.media.command("toggle"))
+            if not playing:                                  # на паузе - кнопка play поверх пластинки
+                p.setPen(NOPEN)
+                p.setBrush(QColor(255, 255, 255, 230))
+                p.drawEllipse(QPointF(cx, cy), 17, 17)
+                draw_media_icon(p, "play", cx + 1.5, cy, 15, QColor(20, 20, 22))
+            self._titles(p, QRectF(r.x() + 12, r.y() + 126, r.width() - 24, 20),
+                         QRectF(r.x() + 12, r.y() + 145, r.width() - 24, 17), st, AC)
             return
         if size == "m":
-            self._cover(p, QRectF(r.x() + 18, r.y() + 18, 134, 134), cover)
-            x0 = r.x() + 166
-            w = r.right() - 18 - x0
-            self._eq(p, x0, r.y() + 20, 11, st["playing"])
-            text(p, QRectF(x0 + 18, r.y() + 17, w - 18, 16), src.upper(), font(10, SEMI), YA_YELLOW, AL | AVC)
-            text(p, QRectF(x0, r.y() + 38, w, 22), st["title"], font(15, SEMI), WHITE, AL | AVC)
-            text(p, QRectF(x0, r.y() + 60, w, 18), st["artist"], font(12), QColor(255, 255, 255, 190), AL | AVC)
-            self._progress(p, QRectF(x0, r.y() + 90, w, 4), st)
-            self._controls(p, x0 + w / 2, r.y() + 134, 26, 56)
+            cover = QRectF(r.x() + 16, r.y() + 24, 122, 122)
+            self._record(p, cover, 56, 58, slide)
+            x0 = r.x() + 198
+            w = r.right() - 16 - x0
+            text(p, QRectF(x0, r.y() + 14, w, 14), src.upper(), font(10, SEMI), YA_YELLOW, AL | AVC)
+            self._titles(p, QRectF(x0, r.y() + 30, w, 22), QRectF(x0, r.y() + 52, w, 18), st, AL | AVC)
+            self._wave(p, QRectF(x0, r.y() + 76, w, 28), st)
+            self._times(p, QRectF(x0, r.y() + 106, w, 14), st)
+            self._controls(p, x0 + w / 2, r.y() + 142, 24, 50)
             return
-        cs = 196
-        self._cover(p, QRectF(r.center().x() - cs / 2, r.y() + 24, cs, cs), cover, 16)
-        self._eq(p, r.x() + 20, r.y() + 20, 12, st["playing"])
-        text(p, QRectF(r.x() + 24, r.y() + 230, r.width() - 48, 24), st["title"], font(17, SEMI), WHITE)
-        text(p, QRectF(r.x() + 24, r.y() + 254, r.width() - 48, 18), st["artist"] + "  ·  " + src, font(12),
-             QColor(255, 255, 255, 190))
-        self._progress(p, QRectF(r.x() + 24, r.y() + 286, r.width() - 48, 4), st)
-        self._controls(p, r.center().x(), r.y() + 334, 30, 72)
+        cover = QRectF(r.x() + 30, r.y() + 24, 186, 186)
+        self._record(p, cover, 86, 76, slide)
+        text(p, QRectF(r.x() + 24, r.y() + 12, r.width() - 48, 12), src.upper(), font(9, SEMI), YA_YELLOW, AR | AVC)
+        self._titles(p, QRectF(r.x() + 24, r.y() + 222, r.width() - 48, 24),
+                     QRectF(r.x() + 24, r.y() + 246, r.width() - 48, 19), st, AC)
+        self._wave(p, QRectF(r.x() + 24, r.y() + 274, r.width() - 48, 34), st)
+        self._times(p, QRectF(r.x() + 24, r.y() + 310, r.width() - 48, 14), st)
+        self._controls(p, r.center().x(), r.y() + 346, 26, 66)
 
     def wheel(self, pos, delta):
         if delta:
@@ -3333,1149 +3478,8 @@ class MusicCard(Card):
         a.toggled.connect(lambda v: self.mgr.set_opt("music_only_yandex", bool(v)))
 
 
-# ---------------------------------------------------------------------------
-#  Claude: мини-чат на рабочем столе (официальная библиотека anthropic)
-# ---------------------------------------------------------------------------
-CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_SYSTEM = ("Ты помощник в маленьком виджете на рабочем столе Windows. Отвечай коротко и по делу, "
-                 "на языке пользователя. Форматируй Markdown умеренно: короткие списки и код допустимы, "
-                 "большие заголовки и таблицы - нет.")
-CLAUDE_ORANGE = QColor("#D97757")
-
-
-class ClaudeCard(Card):
-    KIND = "claude"
-    TITLE = "Claude"
-    SIZES = ("s", "m", "l", "xl")
-    DEFAULT_SIZE = "l"
-    _chunk = Signal(object, object)
-    _done = Signal(object, object)
-
-    def __init__(self, mgr, cfg):
-        super().__init__(mgr, cfg)
-        self.msgs = []                      # история диалога для API
-        self.streaming = ""
-        self.busy = False
-        self.error = None
-        self.tok = 0
-        self._style_key = None
-        self.view = QTextBrowser(self)
-        self.view.setOpenLinks(False)
-        self.view.anchorClicked.connect(self._link)
-        self.view.setFrameShape(QFrame.Shape.NoFrame)
-        self.view.viewport().setAutoFillBackground(False)
-        self.input = QLineEdit(self)
-        self.input.setPlaceholderText("Спроси Claude…  (Enter - отправить)")
-        self.input.returnPressed.connect(self.send)
-        self._chunk.connect(self._on_chunk)
-        self._done.connect(self._on_done)
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.timeout.connect(self.render)
-        self.layout_children()
-        self.render()
-
-    # ----- раскладка и вид -----
-    def layout_children(self):
-        r = self.card_rect()
-        small = self.cfg["size"] == "s"
-        self.view.setVisible(not small)
-        self.input.setVisible(not small)
-        if small:
-            return
-        self.view.setGeometry(int(r.x() + 14), int(r.y() + 46), int(r.width() - 28), int(r.height() - 46 - 58))
-        self.input.setGeometry(int(r.x() + 14), int(r.bottom() - 48), int(r.width() - 28), 34)
-
-    def size_changed(self):
-        self.layout_children()
-
-    def restyle(self, th):
-        key = (self.mgr.style_name(self.cfg),)
-        if key == self._style_key:
-            return
-        self._style_key = key
-        fg, fg2 = th["fg"].name(), th["fg2"].name()
-        light = th["light"]
-        field = "rgba(0,0,0,0.07)" if light else "rgba(255,255,255,0.10)"
-        border = "rgba(0,0,0,0.15)" if light else "rgba(255,255,255,0.18)"
-        self.view.setStyleSheet("QTextBrowser { background: transparent; color: %s; border: none; font-family: '%s';"
-                                " font-size: 13px; } QScrollBar:vertical { width: 6px; background: transparent; }"
-                                " QScrollBar::handle:vertical { background: %s; border-radius: 3px; min-height: 20px; }"
-                                " QScrollBar::add-line, QScrollBar::sub-line { height: 0; }"
-                                % (fg, FONT, border))
-        self.input.setStyleSheet("QLineEdit { background: %s; color: %s; border: 1px solid %s; border-radius: 17px;"
-                                 " padding: 0 14px; font-family: '%s'; font-size: 13px; }"
-                                 " QLineEdit:focus { border: 1px solid %s; }"
-                                 % (field, fg, border, FONT, CLAUDE_ORANGE.name()))
-        self._fg2 = fg2
-        link = "#8A3B1F" if light else "#F0A07E"
-        self._link_col = QColor(link)
-        self.render()
-
-    def render(self):
-        th = self.theme
-        fg2 = th["fg2"].name()
-        parts = []
-        if self.mode() == "web":
-            where = {"panel": "в окошке рядом с виджетом", "app": "в приложении Claude",
-                     "browser": "в браузере"}[self.open_in()]
-            if self.cfg["size"] == "m":
-                parts.append("Напиши вопрос и нажми Enter - откроется claude.ai %s под твоим аккаунтом." % where)
-            else:
-                parts.append("**Claude без API-ключа.** Напиши вопрос внизу и нажми Enter - он откроется на claude.ai "
-                             "%s, под твоим аккаунтом Claude (бесплатным или с подпиской). Войти нужно один раз."
-                             % where)
-            if self.cfg["size"] != "m":
-                asked = self.cfg.get("recent") or []
-                if asked:
-                    parts.append("**Недавние вопросы** (нажми, чтобы спросить снова):")
-                    parts.append("\n".join("- [%s](snowask:%d)" % (q.replace("[", "(").replace("]", ")")[:80], i)
-                                           for i, q in enumerate(asked)))
-                parts.append("*Где открывать и режим с API-ключом - правая кнопка по заголовку виджета.*")
-        elif not self.msgs and not self.busy:
-            if not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY") and self.cfg["size"] == "m":
-                parts.append("**Нужен API-ключ Claude.** Правая кнопка по виджету → «API-ключ Claude...». "
-                             "Создать ключ: [platform.claude.com](https://platform.claude.com/settings/keys)")
-            elif not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY"):
-                parts.append("**Чтобы общаться с Claude, нужен API-ключ.**\n\n"
-                             "1. Открой [platform.claude.com](https://platform.claude.com/settings/keys) и создай ключ.\n"
-                             "2. Правая кнопка по виджету → «API-ключ Claude...» и вставь его.\n\n"
-                             "Ключ хранится на этом компьютере в зашифрованном виде. Запросы платные по тарифам API.\n\n"
-                             "Без ключа: двойной клик по заголовку откроет claude.ai в браузере.")
-            else:
-                parts.append("Привет! Спроси что-нибудь: перевести текст, объяснить ошибку, придумать идею…")
-        for m in self.msgs:
-            if m["role"] == "user":
-                parts.append("<p style='color:%s'><b>Вы:</b> %s</p>" % (fg2, m["content"].replace("<", "&lt;")))
-            else:
-                parts.append(m["content"])
-        if self.busy:
-            parts.append(self.streaming or "<i style='color:%s'>Думаю…</i>" % fg2)
-        if self.error:
-            parts.append("<p style='color:#FF6B6B'>%s</p>" % self.error)
-        app = QApplication.instance()                 # Markdown берёт цвет ссылок из палитры приложения
-        pal = app.palette()
-        link = getattr(self, "_link_col", None) or QColor("#F0A07E")
-        pal.setColor(QPalette.ColorRole.Link, link)
-        pal.setColor(QPalette.ColorRole.LinkVisited, link)
-        app.setPalette(pal)
-        self.view.setMarkdown("\n\n".join(parts))
-        sb = self.view.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def _link(self, url):
-        u = url.toString()
-        if u.startswith("snowask:"):
-            try:
-                self.ask_web((self.cfg.get("recent") or [])[int(u[8:])])
-            except (ValueError, IndexError):
-                pass
-        else:
-            QDesktopServices.openUrl(url)
-
-    def api_key(self):
-        return secret_reveal(self.mgr.cfg.get("claude_key"))
-
-    def mode(self):
-        """web - через claude.ai под своим аккаунтом (без ключа), api - через API-ключ."""
-        m = self.cfg.get("mode")
-        if m in ("web", "api"):
-            return m
-        return "api" if (self.api_key() or os.environ.get("ANTHROPIC_API_KEY")) else "web"
-
-    def open_in(self):
-        o = self.cfg.get("open_in")
-        if o in ("panel", "app", "browser"):
-            return o
-        return "panel" if web_engine() is not None else "app"
-
-    def ask_web(self, q=""):
-        where = self.open_in()
-        if where == "panel":
-            panel = self.mgr.claude_panel()
-            if panel is not None:
-                panel.open(claude_url(q), near=self.frameGeometry())
-                return
-            where = "app"
-        if where == "app":
-            open_target("claude://claude.ai/new" + (("?q=" + urllib.parse.quote(q)) if q else ""), claude_url(q))
-        else:
-            open_target(claude_url(q))
-
-    # ----- запрос -----
-    def send(self):
-        q = self.input.text().strip()
-        if self.mode() == "web":
-            self.input.clear()
-            if q:
-                recent = [x for x in (self.cfg.get("recent") or []) if x != q]
-                self.cfg["recent"] = ([q] + recent)[:6]
-                self.mgr.save()
-                self.render()
-            self.ask_web(q)
-            return
-        if not q or self.busy:
-            return
-        if not DEMO and not self.api_key() and not os.environ.get("ANTHROPIC_API_KEY"):
-            self.ask_key()
-            if not self.api_key():
-                return
-        self.input.clear()
-        self.msgs.append({"role": "user", "content": q})
-        self.busy, self.streaming, self.error = True, "", None
-        self.tok += 1
-        tok, history, key = self.tok, list(self.msgs), self.api_key()
-        self.render()
-        self.update()
-        threading.Thread(target=self._work, args=(tok, history, key), daemon=True).start()
-
-    def _emit(self, sig, *args):
-        try:
-            sig.emit(*args)
-        except RuntimeError:
-            pass
-
-    def _work(self, tok, history, key):
-        if DEMO:
-            for word in ("Это **тестовый** ответ виджета. ", "Здесь появится ответ Claude, ",
-                         "который печатается по мере генерации."):
-                time.sleep(0.15)
-                self._emit(self._chunk, tok, word)
-            self._emit(self._done, tok, None)
-            return
-        try:
-            import anthropic
-        except ImportError:
-            pip_install("anthropic")
-            try:
-                import anthropic
-            except ImportError:
-                self._emit(self._done, tok, "Нет библиотеки anthropic. Выполни: pip install anthropic")
-                return
-        err = None
-        try:
-            client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
-            params = dict(model=CLAUDE_MODEL, max_tokens=64000, system=CLAUDE_SYSTEM, messages=history)
-            try:
-                # если запрос отклонят фильтры безопасности, API сам повторит его на подходящей модели
-                ctx = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-                                                  **params)
-            except TypeError:                            # старая версия библиотеки без fallbacks
-                ctx = client.messages.stream(**params)
-            with ctx as stream:
-                for piece in stream.text_stream:
-                    self._emit(self._chunk, tok, piece)
-                final = stream.get_final_message()
-            if final.stop_reason == "refusal":
-                err = "Claude не стал отвечать на этот запрос."
-            elif final.stop_reason == "max_tokens":
-                err = "Ответ получился слишком длинным и обрезан."
-        except anthropic.AuthenticationError:
-            err = "Неверный API-ключ. Правая кнопка → «API-ключ Claude...»"
-        except anthropic.PermissionDeniedError:
-            err = "У ключа нет доступа к этой модели."
-        except anthropic.RateLimitError:
-            err = "Слишком много запросов - подожди минутку."
-        except anthropic.APIStatusError as ex:
-            err = "Ошибка сервера Claude (%s). Попробуй ещё раз." % ex.status_code
-        except anthropic.APIConnectionError:
-            err = "Нет связи с сервером Claude."
-        except anthropic.AnthropicError as ex:
-            err = "Не получилось: %s" % (str(ex)[:160] or "нужен API-ключ")
-        except Exception as ex:
-            err = "Не получилось: %s" % str(ex)[:160]
-        self._emit(self._done, tok, err)
-
-    def _on_chunk(self, tok, piece):
-        if tok != self.tok:
-            return
-        self.streaming += piece
-        if not self._render_timer.isActive():
-            self._render_timer.start(60)
-
-    def _on_done(self, tok, err):
-        if tok != self.tok:
-            return
-        self.busy = False
-        if self.streaming.strip():
-            self.msgs.append({"role": "assistant", "content": self.streaming})
-        elif self.msgs and self.msgs[-1]["role"] == "user":
-            self.msgs.pop()                       # ответа нет - вопрос из истории убираем
-        self.streaming, self.error = "", err
-        self.render()
-        self.update()
-
-    def new_chat(self):
-        self.tok += 1
-        self.msgs, self.streaming, self.busy, self.error = [], "", False, None
-        self.render()
-        self.update()
-
-    def ask_key(self):
-        key, ok = QInputDialog.getText(None, "API-ключ Claude",
-                                       "Вставь API-ключ (начинается с sk-ant-).\n"
-                                       "Создать: platform.claude.com → Settings → API keys.",
-                                       QLineEdit.EchoMode.Password)
-        if ok and key.strip():
-            self.mgr.set_opt("claude_key", secret_protect(key.strip()))
-            self.set_opt("mode", "api")
-            self.render()
-
-    # ----- рисование -----
-    def paint(self, p, r, th):
-        self.restyle(th)
-        if self.cfg["size"] == "s":
-            draw_bubble(p, r.center().x(), r.y() + 62, 64, WHITE if th["mode"] == "color" else CLAUDE_ORANGE)
-            text(p, QRectF(r.x(), r.y() + 104, r.width(), 22), "Claude", font(16, SEMI), th["fg"])
-            text(p, QRectF(r.x() + 8, r.y() + 126, r.width() - 16, 18), "Спросить в чате", font(12), th["fg2"])
-            return
-        draw_bubble(p, r.x() + 30, r.y() + 24, 24, WHITE if th["mode"] == "color" else CLAUDE_ORANGE, dots=False)
-        text(p, QRectF(r.x() + 50, r.y() + 12, 120, 24), "Claude", font(15, SEMI), th["fg"], AL | AVC)
-        if self.busy:
-            t = time.time()
-            for i in range(3):
-                a = 0.3 + 0.7 * abs(math.sin(t * 4 - i * 0.6))
-                c = QColor(WHITE if th["mode"] == "color" else CLAUDE_ORANGE)
-                c.setAlphaF(a)
-                p.setPen(NOPEN)
-                p.setBrush(c)
-                p.drawEllipse(QPointF(r.x() + 118 + i * 9, r.y() + 24), 2.6, 2.6)
-            self.want_frame(40)
-        nb = QRectF(r.right() - 44, r.y() + 10, 28, 28)
-        p.setPen(NOPEN)
-        p.setBrush(th["btn"])
-        p.drawEllipse(nb.center(), 13, 13)
-        pen = QPen(th["fg"], 2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        c = nb.center()
-        p.drawLine(QPointF(c.x() - 5, c.y()), QPointF(c.x() + 5, c.y()))
-        p.drawLine(QPointF(c.x(), c.y() - 5), QPointF(c.x(), c.y() + 5))
-        self.hit(nb, self.new_chat if self.mode() == "api" else (lambda: self.ask_web("")))
-        text(p, QRectF(r.right() - 200, r.y() + 12, 150, 24), "Opus 5.5" if self.mode() == "api" else "claude.ai",
-             font(11), th["fg2"], AR | AVC)
-
-    def clicked(self, pos):
-        if self.cfg["size"] == "s":
-            self.ask_web("") if self.mode() == "web" else self.activate()
-        else:
-            self.activateWindow()
-            self.input.setFocus()
-
-    def activate(self):
-        if self.mode() == "web":
-            self.ask_web("")
-            return
-        local = os.environ.get("LOCALAPPDATA", "")
-        open_target(os.path.join(local, "AnthropicClaude", "claude.exe"), "https://claude.ai/new")
-
-    def extra_menu(self, menu):
-        mm = menu.addMenu("Режим")
-        grp = QActionGroup(mm)
-        for key, label in (("web", "Через claude.ai - без ключа, под своим аккаунтом"),
-                           ("api", "Через API-ключ - ответ прямо в виджете")):
-            a = mm.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(self.mode() == key)
-            grp.addAction(a)
-            a.triggered.connect(lambda _=False, k=key: (self.set_opt("mode", k), self.render()))
-        om = menu.addMenu("Где открывать claude.ai")
-        grp2 = QActionGroup(om)
-        for key, label in (("panel", "В окошке рядом с виджетом"), ("app", "В приложении Claude"),
-                           ("browser", "В браузере")):
-            a = om.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(self.open_in() == key)
-            a.setEnabled(key != "panel" or web_engine() is not None)
-            grp2.addAction(a)
-            a.triggered.connect(lambda _=False, k=key: (self.set_opt("open_in", k), self.render()))
-        menu.addAction("Новый чат").triggered.connect(self.new_chat if self.mode() == "api" else (lambda: self.ask_web("")))
-        menu.addAction("API-ключ Claude...").triggered.connect(self.ask_key)
-        if self.mgr.cfg.get("claude_key"):
-            menu.addAction("Удалить сохранённый ключ").triggered.connect(
-                lambda: (self.mgr.cfg.pop("claude_key", None), self.mgr.save(), self.render()))
-        menu.addAction("Открыть claude.ai").triggered.connect(lambda: open_target("https://claude.ai/new"))
-
-
-# ---------------------------------------------------------------------------
-#  Discord: кто в сети на твоём сервере (официальный виджет сервера Discord)
-# ---------------------------------------------------------------------------
-DISCORD_BLURPLE = QColor("#5865F2")
-DISCORD_STATUS = {"online": QColor("#23A55A"), "idle": QColor("#F0B232"), "dnd": QColor("#F23F43")}
-
-
-def demo_discord():
-    names = [("Снеговик", "online", "Minecraft"), ("Лиса", "idle", None), ("Пельмень", "dnd", "Dota 2"),
-             ("Кот Борис", "online", None), ("Ёлка", "online", "Spotify"), ("Мандарин", "online", None),
-             ("Зима", "idle", None), ("Сугроб", "online", "CS2")]
-    members = []
-    for i, (n, s, g) in enumerate(names):
-        m = {"id": str(i), "username": n, "status": s, "avatar_url": ""}
-        if g:
-            m["game"] = {"name": g}
-        if i in (0, 3, 5):
-            m["channel_id"] = "v1"
-        members.append(m)
-    return {"id": "1", "name": "Снежный сервер", "presence_count": 42, "instant_invite": "https://discord.gg/example",
-            "channels": [{"id": "v1", "name": "Общий голосовой", "position": 0},
-                         {"id": "v2", "name": "Игры", "position": 1}], "members": members}
-
-
-class DiscordCard(Card):
-    KIND = "discord"
-    TITLE = "Discord: сервер"
-    DEFAULT_SIZE = "m"
-    _got = Signal(object, object, object)
-    _ava = Signal(object, object)
-
-    def __init__(self, mgr, cfg):
-        super().__init__(mgr, cfg)
-        self.data = cfg.get("cache")
-        self.error = None
-        self.busy = False
-        self.avatars = {}
-        self._got.connect(self._on_data)
-        self._ava.connect(self._on_avatar)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh)
-        self.timer.start(2 * 60 * 1000)
-        QTimer.singleShot(300, self.refresh)
-
-    # ----- данные -----
-    def refresh(self):
-        gid = self.cfg.get("guild")
-        if self.busy or (not gid and not DEMO):
-            return
-        self.busy = True
-
-        def work():
-            data, err = None, None
-            try:
-                if DEMO:
-                    data = demo_discord()
-                else:
-                    data = http_json("https://discord.com/api/guilds/%s/widget.json" % gid)
-            except urllib.error.HTTPError as ex:
-                err = ("У сервера выключен виджет: Настройки сервера → Виджет → «Включить виджет сервера»"
-                       if ex.code == 403 else "Сервер не найден - проверь ID" if ex.code in (400, 404)
-                       else "Discord ответил ошибкой %d" % ex.code)
-            except Exception:
-                err = "Нет связи с Discord"
-            self._emit(self._got, gid, data, err)
-            for m in ((data or {}).get("members") or [])[:16]:
-                url = m.get("avatar_url")
-                if not url or m.get("id") in self.avatars:
-                    continue
-                try:
-                    req = urllib.request.Request(url, headers=UA)
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        img = QImage.fromData(resp.read())
-                    if not img.isNull():
-                        self._emit(self._ava, m["id"], img)
-                except Exception:
-                    continue
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _emit(self, sig, *args):
-        try:
-            sig.emit(*args)
-        except RuntimeError:
-            pass
-
-    def _on_data(self, gid, data, err):
-        self.busy = False
-        self.error = err
-        if data is not None:
-            self.data = data
-            self.cfg["cache"] = data
-            self.mgr.save()
-        self.update()
-
-    def _on_avatar(self, mid, img):
-        self.avatars[mid] = img.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                       Qt.TransformationMode.SmoothTransformation)
-        self.update()
-
-    # ----- рисование -----
-    def _avatar(self, p, m, cx, cy, rad, th):
-        img = self.avatars.get(m.get("id"))
-        p.save()
-        path = QPainterPath()
-        path.addEllipse(QPointF(cx, cy), rad, rad)
-        if img is not None:
-            p.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            p.drawImage(QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), img)
-            p.setClipping(False)
-        else:
-            hue = (sum(map(ord, m.get("username", "?"))) * 37) % 360
-            p.setPen(NOPEN)
-            p.setBrush(QColor.fromHsv(hue, 120, 200))
-            p.drawPath(path)
-            text(p, QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), (m.get("username") or "?")[:1].upper(),
-                 font(rad * 0.95, SEMI), WHITE)
-        p.restore()
-        col = DISCORD_STATUS.get(m.get("status"), DISCORD_STATUS["online"])
-        p.setPen(QPen(th["bg2"] if th["mode"] != "color" else QColor(self.kind_colors()[1]), max(2.0, rad * 0.16)))
-        p.setBrush(col)
-        p.drawEllipse(QPointF(cx + rad * 0.72, cy + rad * 0.72), rad * 0.3, rad * 0.3)
-
-    def _header(self, p, r, th, d):
-        draw_bubble(p, r.x() + 30, r.y() + 25, 24, DISCORD_BLURPLE if th["mode"] != "color" else WHITE, dots=False)
-        text(p, QRectF(r.x() + 50, r.y() + 12, r.width() - 160, 24), d.get("name") or "Discord", font(15, SEMI),
-             th["fg"], AL | AVC)
-        online = int(d.get("presence_count") or 0)
-        pill = QRectF(r.right() - 104, r.y() + 13, 88, 22)
-        p.setPen(NOPEN)
-        p.setBrush(th["btn"])
-        p.drawRoundedRect(pill, 11, 11)
-        p.setBrush(DISCORD_STATUS["online"])
-        p.drawEllipse(QPointF(pill.x() + 13, pill.center().y()), 4, 4)
-        text(p, pill.adjusted(22, 0, -6, 0), "%d в сети" % online, font(11, SEMI), th["fg"], AL | AVC)
-
-    def voice(self, d):
-        chans = {c["id"]: c for c in d.get("channels") or []}
-        groups = {}
-        for m in d.get("members") or []:
-            if m.get("channel_id") in chans:
-                groups.setdefault(m["channel_id"], []).append(m)
-        return [(chans[k], v) for k, v in sorted(groups.items(), key=lambda kv: chans[kv[0]].get("position", 0))]
-
-    def paint(self, p, r, th):
-        d = self.data
-        size = self.cfg["size"]
-        if not d:
-            draw_bubble(p, r.center().x(), r.y() + r.height() * 0.3, 40, DISCORD_BLURPLE, dots=False)
-            msg = self.error or ("Загружаю…" if self.cfg.get("guild") else "Нажми, чтобы подключить свой сервер")
-            p.setFont(font(12))
-            p.setPen(th["fg2"])
-            p.drawText(QRectF(r.x() + 14, r.y() + r.height() * 0.48, r.width() - 28, r.height() * 0.5),
-                       int(AC | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
-            return
-        members = d.get("members") or []
-        if size == "s":
-            draw_bubble(p, r.x() + 28, r.y() + 26, 22, DISCORD_BLURPLE if th["mode"] != "color" else WHITE, dots=False)
-            text(p, QRectF(r.x() + 46, r.y() + 14, r.width() - 60, 24), d.get("name") or "", font(13, SEMI),
-                 th["fg"], AL | AVC)
-            online = self.av("online", float(d.get("presence_count") or 0), 4.0, start=0.0)
-            text(p, QRectF(r.x() + 16, r.y() + 42, r.width() - 32, 50), str(int(round(online))), font(42, LIGHT),
-                 th["fg"], AL | AVC)
-            p.setPen(NOPEN)
-            p.setBrush(DISCORD_STATUS["online"])
-            p.drawEllipse(QPointF(r.x() + 21, r.y() + 102), 4, 4)
-            text(p, QRectF(r.x() + 30, r.y() + 93, r.width() - 40, 18), "в сети", font(12), th["fg2"], AL | AVC)
-            for i, m in enumerate(members[:5]):
-                self._avatar(p, m, r.x() + 30 + i * 26, r.bottom() - 30, 13, th)
-            return
-        self._header(p, r, th, d)
-        if size == "m":
-            n = min(8, len(members))
-            for i, m in enumerate(members[:n]):
-                self._avatar(p, m, r.x() + 36 + i * 41, r.y() + 74, 17, th)
-            y = r.y() + 106
-            vc = self.voice(d)
-            if vc:
-                for ch, ms in vc[:2]:
-                    text(p, QRectF(r.x() + 20, y, r.width() - 40, 20), "🔊 %s — %d" % (ch["name"], len(ms)),
-                         font(12), th["fg2"], AL | AVC)
-                    y += 22
-            else:
-                games = [m for m in members if m.get("game")]
-                line = ", ".join("%s: %s" % (m["username"], m["game"]["name"]) for m in games[:3]) or "Никто не в голосовых каналах"
-                p.setFont(font(12))
-                p.setPen(th["fg2"])
-                p.drawText(QRectF(r.x() + 20, y, r.width() - 40, 44),
-                           int(AL | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), line)
-            return
-        y = r.y() + 50
-        vc = self.voice(d)
-        for ch, ms in vc[:2]:
-            text(p, QRectF(r.x() + 20, y, r.width() - 40, 18), "🔊 " + ch["name"], font(12, SEMI), th["accent"], AL | AVC)
-            y += 20
-            for i, m in enumerate(ms[:6]):
-                self._avatar(p, m, r.x() + 32 + i * 32, y + 14, 12, th)
-            y += 34
-        if vc:
-            p.setPen(QPen(th["line"], 1))
-            p.drawLine(QPointF(r.x() + 20, y), QPointF(r.right() - 20, y))
-            y += 6
-        row = 38
-        for m in members:
-            if y + row > r.bottom() - 8:
-                break
-            self._avatar(p, m, r.x() + 36, y + row / 2, 14, th)
-            game = (m.get("game") or {}).get("name")
-            if game:
-                text(p, QRectF(r.x() + 60, y + 2, r.width() - 80, 18), m.get("username", ""), font(13, SEMI),
-                     th["fg"], AL | AVC)
-                text(p, QRectF(r.x() + 60, y + 19, r.width() - 80, 16), "Играет в " + game, font(11), th["fg2"],
-                     AL | AVC)
-            else:
-                text(p, QRectF(r.x() + 60, y, r.width() - 80, row), m.get("username", ""), font(13, SEMI), th["fg"],
-                     AL | AVC)
-            y += row
-
-    # ----- действия -----
-    def clicked(self, pos):
-        if not self.cfg.get("guild") and not DEMO:
-            self.ask_guild()
-
-    def activate(self):
-        gid = self.cfg.get("guild") or ""
-        open_target("discord://-/channels/%s" % gid if gid else "discord://",
-                    "https://discord.com/channels/%s" % gid if gid else "https://discord.com/app")
-
-    def ask_guild(self):
-        val, ok = QInputDialog.getText(
-            None, "Discord - мой сервер",
-            "1. Discord → Настройки сервера → Виджет → включи «Включить виджет сервера».\n"
-            "2. На той же странице скопируй «ID сервера» и вставь сюда\n"
-            "    (подойдёт и ссылка вида discord.com/channels/123456...).",
-            text=self.cfg.get("guild") or "")
-        if not ok:
-            return
-        import re
-        nums = re.findall(r"\d{15,22}", val)
-        if not nums:
-            self.error = "Не нашёл ID сервера (это длинное число)"
-            self.update()
-            return
-        self.cfg["guild"] = nums[0]
-        self.cfg.pop("cache", None)
-        self.data, self.error, self.avatars = None, None, {}
-        self.mgr.save()
-        self.update()
-        self.refresh()
-
-    def extra_menu(self, menu):
-        menu.addAction("Указать сервер...").triggered.connect(self.ask_guild)
-        menu.addAction("Обновить").triggered.connect(self.refresh)
-        menu.addAction("Открыть Discord").triggered.connect(self.activate)
-        inv = (self.data or {}).get("instant_invite")
-        if inv:
-            menu.addAction("Скопировать приглашение").triggered.connect(
-                lambda: QApplication.clipboard().setText(inv))
-
-    def closing(self):
-        self.timer.stop()
-
-
-# ---------------------------------------------------------------------------
-#  Уведомления (Discord и других программ) - из журнала уведомлений Windows
-# ---------------------------------------------------------------------------
-NOTIFY_APPS = {"discord": "Discord", "telegram": "Telegram", "all": "Все программы"}
-
-
-def notify_app_name(aumid):
-    a = (aumid or "").lower()
-    for key, title in (("discord", "Discord"), ("telegram", "Telegram"), ("whatsapp", "WhatsApp"),
-                       ("chrome", "Chrome"), ("msedge", "Edge"), ("firefox", "Firefox"), ("outlook", "Outlook"),
-                       ("teams", "Teams"), ("steam", "Steam"), ("vk", "VK"), ("yandex", "Яндекс")):
-        if key in a:
-            return title
-    base = (aumid or "").split("!")[0].split("_")[0]          # Microsoft.WindowsStore_8wekyb3d8bbwe!App
-    tail = base.split(".")[-1] if base else ""
-    return tail[:24] or "Программа"
-
-
-def wpn_db_path():
-    p = os.environ.get("SNOWWIDGETS_WPNDB")
-    if p:
-        return p
-    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications", "wpndatabase.db")
-
-
-def parse_toast(payload):
-    """XML уведомления -> (заголовок, текст, путь к картинке)."""
-    import xml.etree.ElementTree as ET
-    if isinstance(payload, (bytes, bytearray)):
-        payload = payload.decode("utf-8", "replace")
-    try:
-        root = ET.fromstring(payload)
-    except Exception:
-        return None
-    texts = [(t.text or "").strip() for t in root.iter("text") if (t.text or "").strip()]
-    img = None
-    for im in root.iter("image"):
-        src = im.get("src") or ""
-        if src.startswith("file:///"):
-            src = urllib.parse.unquote(src[8:])
-            if not (len(src) > 1 and src[1] == ":"):         # не "C:/..." - путь Linux/macOS
-                src = "/" + src
-        elif src.startswith("file://"):
-            src = urllib.parse.unquote(src[7:])
-        if src and os.path.isfile(src):
-            img = src
-            if im.get("placement") == "appLogoOverride":
-                break
-    if not texts:
-        return None
-    return texts[0], "\n".join(texts[1:]), img
-
-
-class NotifyService(QObject):
-    """Раз в 2 секунды смотрит журнал уведомлений Windows (тот же, что показывает Центр уведомлений).
-    Уведомления, которые уже закрыли в Windows, остаются в виджете - он хранит свою историю."""
-    updated = Signal()
-    _got = Signal(object)
-
-    def __init__(self):
-        super().__init__()
-        self.items = []            # [{id, app, aumid, title, body, img, time}] новые сверху
-        self.error = None
-        self.seen = set()
-        self.read_until = 0.0
-        self._sig = None
-        self.hist_file = os.path.join(DATA_DIR, "notifications.json")
-        try:
-            with open(self.hist_file, encoding="utf-8") as fh:
-                data = json.load(fh)
-            self.items = data.get("items", [])[:200]
-            self.read_until = float(data.get("read_until", 0))
-            self.seen = {it["id"] for it in self.items}
-        except Exception:
-            pass
-        self._got.connect(self._on)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll)
-        self.timer.start(2000)
-        self._busy = False
-        QTimer.singleShot(200, self.poll)
-
-    def poll(self):
-        if self._busy:
-            return
-        self._busy = True
-        threading.Thread(target=self._work, daemon=True).start()
-
-    def _work(self):
-        try:
-            res = self._read()
-        except Exception as ex:
-            res = {"error": "Не удалось прочитать уведомления Windows (%s)" % type(ex).__name__}
-        try:
-            self._got.emit(res)
-        except RuntimeError:
-            pass
-
-    def _read(self):
-        if DEMO and not os.environ.get("SNOWWIDGETS_WPNDB"):
-            return {"rows": []}
-        db = wpn_db_path()
-        if not os.path.isfile(db):
-            return {"error": "Журнал уведомлений Windows не найден" if IS_WIN else "Работает только в Windows"}
-        sig = []
-        for ext in ("", "-wal"):
-            try:
-                st = os.stat(db + ext)
-                sig.append((st.st_mtime, st.st_size))
-            except OSError:
-                sig.append(None)
-        if sig == self._sig:
-            return None                                     # ничего не поменялось
-        self._sig = sig
-        import sqlite3
-        tmp = os.path.join(DATA_DIR, "wpn_copy")
-        os.makedirs(tmp, exist_ok=True)
-        dst = os.path.join(tmp, "wpn.db")
-        for ext in ("", "-wal", "-shm"):                   # копия, чтобы не мешать Windows
-            try:
-                if os.path.exists(db + ext):
-                    shutil.copyfile(db + ext, dst + ext)
-                elif os.path.exists(dst + ext):
-                    os.remove(dst + ext)
-            except OSError:
-                pass
-        con = sqlite3.connect(dst, timeout=2)
-        try:
-            rows = con.execute(
-                "SELECT n.Id, n.ArrivalTime, n.Payload, h.PrimaryId FROM Notification n "
-                "LEFT JOIN NotificationHandler h ON n.HandlerId = h.RecordId "
-                "WHERE n.Type = 'toast' ORDER BY n.ArrivalTime DESC LIMIT 150").fetchall()
-        finally:
-            con.close()
-        out = []
-        for nid, arrival, payload, aumid in rows:
-            t = parse_toast(payload)
-            if t is None:
-                continue
-            try:
-                ts = (int(arrival) / 1e7) - 11644473600     # FILETIME -> unix
-            except Exception:
-                ts = time.time()
-            out.append({"id": "%s:%s" % (aumid, nid), "aumid": aumid or "", "app": notify_app_name(aumid),
-                        "title": t[0], "body": t[1], "img": t[2], "time": ts})
-        return {"rows": out}
-
-    def _on(self, res):
-        self._busy = False
-        if res is None:
-            return
-        if "error" in res:
-            self.error = res["error"]
-            self.updated.emit()
-            return
-        self.error = None
-        fresh = [r for r in res["rows"] if r["id"] not in self.seen]
-        if not fresh:
-            if self.error is not None:
-                self.updated.emit()
-            return
-        for r in fresh:
-            self.seen.add(r["id"])
-        self.items = sorted(fresh + self.items, key=lambda r: -r["time"])[:200]
-        self.save()
-        self.updated.emit()
-
-    def add_demo(self, app, title, body):
-        r = {"id": "demo:%f" % time.time(), "aumid": app, "app": notify_app_name(app), "title": title,
-             "body": body, "img": None, "time": time.time()}
-        self._on({"rows": [r]})
-
-    def save(self):
-        try:
-            with open(self.hist_file, "w", encoding="utf-8") as fh:
-                json.dump({"items": self.items[:200], "read_until": self.read_until}, fh, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def filtered(self, which):
-        if which == "all":
-            return list(self.items)
-        return [it for it in self.items if which in (it.get("aumid") or "").lower()]
-
-    def mark_read(self):
-        self.read_until = time.time()
-        self.save()
-        self.updated.emit()
-
-    def clear(self, which):
-        keep = [it for it in self.items if it not in self.filtered(which)]
-        self.items = keep
-        self.save()
-        self.updated.emit()
-
-
-def time_ago(ts):
-    d = time.time() - ts
-    if d < 60:
-        return "сейчас"
-    if d < 3600:
-        return "%d мин" % (d // 60)
-    t = datetime.datetime.fromtimestamp(ts)
-    if t.date() == datetime.date.today():
-        return t.strftime("%H:%M")
-    if (datetime.date.today() - t.date()).days == 1:
-        return "вчера"
-    return "%d %s" % (t.day, MONTHS_GEN[t.month - 1][:3])
-
-
-class NotifyCard(Card):
-    KIND = "notify"
-    TITLE = "Уведомления Discord"
-    DEFAULT_SIZE = "l"
-
-    def __init__(self, mgr, cfg):
-        super().__init__(mgr, cfg)
-        cfg.setdefault("apps", "discord")
-        self.svc = mgr.notify()
-        self.svc.updated.connect(self._changed)
-        self.imgs = {}
-        self.flash_t0 = 0.0
-        self._count = len(self.items())
-
-    def items(self):
-        return self.svc.filtered(self.cfg.get("apps", "discord"))
-
-    def _changed(self):
-        n = len(self.items())
-        if n > self._count and self.animated:
-            self.flash_t0 = time.time()                    # новое уведомление - вспышка рамки
-        self._count = n
-        self.update()
-
-    def unread(self):
-        return [it for it in self.items() if it["time"] > self.svc.read_until]
-
-    def _img(self, path):
-        if not path:
-            return None
-        if path not in self.imgs:
-            img = QImage(path)
-            self.imgs[path] = None if img.isNull() else img.scaled(
-                64, 64, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        return self.imgs[path]
-
-    def _avatar(self, p, it, cx, cy, rad):
-        img = self._img(it.get("img"))
-        p.save()
-        path = QPainterPath()
-        path.addEllipse(QPointF(cx, cy), rad, rad)
-        p.setClipPath(path, Qt.ClipOperation.IntersectClip)
-        if img is not None:
-            p.drawImage(QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), img)
-        else:
-            col = DISCORD_BLURPLE if "discord" in it.get("aumid", "").lower() else \
-                QColor.fromHsv((sum(map(ord, it["title"])) * 37) % 360, 120, 200)
-            p.fillPath(path, col)
-            text(p, QRectF(cx - rad, cy - rad, 2 * rad, 2 * rad), it["title"][:1].upper(), font(rad * 0.9, SEMI), WHITE)
-        p.restore()
-
-    def _title(self):
-        return {"discord": "Discord", "telegram": "Telegram"}.get(self.cfg.get("apps"), "Уведомления")
-
-    def paint(self, p, r, th):
-        items = self.items()
-        unread = self.unread()
-        icon_col = WHITE if th["mode"] == "color" else DISCORD_BLURPLE
-        e = (time.time() - self.flash_t0) / 1.4 if self.flash_t0 else 1.0
-        if e < 1.0:                                        # вспышка при новом уведомлении
-            self.want_frame(16)
-            c = QColor(DISCORD_BLURPLE)
-            c.setAlpha(int(150 * (1 - e) * (0.6 + 0.4 * math.sin(e * 18))))
-            p.save()
-            p.setPen(QPen(c, 6))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r.adjusted(3, 3, -3, -3), RADIUS - 2, RADIUS - 2)
-            p.restore()
-        size = self.cfg["size"]
-        if size == "s":
-            draw_bubble(p, r.x() + 28, r.y() + 26, 22, icon_col, dots=False)
-            text(p, QRectF(r.x() + 46, r.y() + 14, r.width() - 56, 24), self._title(), font(13, SEMI), th["fg"], AL | AVC)
-            n = self.av("unread", float(len(unread)), 5.0, start=0.0)
-            text(p, QRectF(r.x() + 16, r.y() + 42, r.width() - 32, 50), str(int(round(n))), font(42, LIGHT),
-                 th["fg"], AL | AVC)
-            text(p, QRectF(r.x() + 18, r.y() + 92, r.width() - 32, 18),
-                 plural(len(unread), "новое", "новых", "новых"), font(12), th["fg2"], AL | AVC)
-            if items:
-                text(p, QRectF(r.x() + 16, r.bottom() - 34, r.width() - 32, 18), items[0]["title"], font(11, SEMI),
-                     th["fg"], AL | AVC)
-            return
-        draw_bubble(p, r.x() + 30, r.y() + 25, 24, icon_col, dots=False)
-        text(p, QRectF(r.x() + 50, r.y() + 12, r.width() - 150, 24), self._title(), font(15, SEMI), th["fg"], AL | AVC)
-        if unread:
-            label = str(len(unread)) if len(unread) < 100 else "99+"
-            p.setFont(font(15, SEMI))
-            tw = p.fontMetrics().horizontalAdvance(self._title())
-            p.setFont(font(11, SEMI))
-            bw = max(22, p.fontMetrics().horizontalAdvance(label) + 14)
-            pill = QRectF(r.x() + 50 + tw + 8, r.y() + 14, bw, 20)
-            p.setPen(NOPEN)
-            p.setBrush(RED)
-            p.drawRoundedRect(pill, 10, 10)
-            text(p, pill, label, font(11, SEMI), WHITE)
-        if items:
-            cb = QRectF(r.right() - 104, r.y() + 13, 88, 22)
-            p.setPen(NOPEN)
-            p.setBrush(th["btn"])
-            p.drawRoundedRect(cb, 11, 11)
-            text(p, cb, "Прочитано" if unread else "Очистить", font(11, SEMI), th["fg"])
-            self.hit(cb, self.svc.mark_read if unread else (lambda: self.svc.clear(self.cfg.get("apps", "discord"))))
-        if not items:
-            msg = self.svc.error or ("Пока нет уведомлений.\nВ Discord: Настройки → Уведомления → «Включить "
-                                     "уведомления на рабочем столе». Пока окно Discord открыто, он их не присылает.")
-            p.setFont(font(12))
-            p.setPen(th["fg2"])
-            p.drawText(QRectF(r.x() + 18, r.y() + 52, r.width() - 36, r.height() - 64),
-                       int(AL | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), msg)
-            return
-        y = r.y() + 48
-        row = 56 if size != "m" else 50
-        for i, it in enumerate(items):
-            if y + row > r.bottom() - 6:
-                break
-            k = self.av("in:" + it["id"], 1.0, 9.0, start=0.0)       # новое уведомление выезжает сверху
-            p.save()
-            p.setOpacity(p.opacity() * k)
-            p.translate((1 - k) * 30, 0)
-            new = it["time"] > self.svc.read_until
-            rc = QRectF(r.x() + 10, y, r.width() - 20, row - 4)
-            if new:
-                p.setPen(NOPEN)
-                p.setBrush(th["btn"])
-                p.drawRoundedRect(rc, 12, 12)
-            self._avatar(p, it, rc.x() + 24, rc.center().y(), 16)
-            tx = rc.x() + 48
-            text(p, QRectF(tx, rc.y() + 5, rc.width() - 48 - 54, 18), it["title"], font(13, SEMI), th["fg"], AL | AVC)
-            text(p, QRectF(rc.right() - 56, rc.y() + 5, 48, 18), time_ago(it["time"]), font(11), th["fg2"], AR | AVC)
-            body = " ".join((it.get("body") or "").split())
-            if self.cfg.get("apps") == "all":
-                body = it["app"] + " · " + body
-            text(p, QRectF(tx, rc.y() + 24, rc.width() - 48 - 10, 18), body, font(12), th["fg2"], AL | AVC)
-            if new:
-                p.setPen(NOPEN)
-                p.setBrush(DISCORD_BLURPLE)
-                p.drawEllipse(QPointF(rc.x() + 6, rc.center().y()), 3, 3)
-            p.restore()
-            self.hit(rc, lambda a=it.get("aumid", ""): self.open_app(a))
-            y += row
-        self.want_frame(30 * 1000)                          # обновлять "5 мин назад"
-
-    def open_app(self, aumid=""):
-        self.svc.mark_read()
-        a = aumid.lower()
-        if "telegram" in a:
-            open_target("tg://", "https://web.telegram.org/")
-        elif "discord" in a or self.cfg.get("apps") == "discord":
-            open_target("discord://", "https://discord.com/app")
-
-    def activate(self):
-        self.open_app(self.cfg.get("apps", "discord"))
-
-    def extra_menu(self, menu):
-        sm = menu.addMenu("Чьи уведомления показывать")
-        grp = QActionGroup(sm)
-        for key, label in NOTIFY_APPS.items():
-            a = sm.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(self.cfg.get("apps") == key)
-            grp.addAction(a)
-            a.triggered.connect(lambda _=False, k=key: (self.set_opt("apps", k), setattr(self, "_count",
-                                                                                         len(self.items()))))
-        menu.addAction("Отметить всё прочитанным").triggered.connect(self.svc.mark_read)
-        menu.addAction("Очистить список").triggered.connect(lambda: self.svc.clear(self.cfg.get("apps", "discord")))
-        menu.addAction("Открыть Discord").triggered.connect(lambda: open_target("discord://", "https://discord.com/app"))
-        menu.addAction("Настройки уведомлений Windows").triggered.connect(
-            lambda: open_target("ms-settings:notifications"))
-
-
-# ---------------------------------------------------------------------------
-#  Claude без API-ключа: claude.ai во встроенном окошке (вход под своим аккаунтом)
-# ---------------------------------------------------------------------------
-CLAUDE_WEB_HOSTS = ("claude.ai", "claude.com", "anthropic.com", "accounts.google.com", "google.com",
-                    "gstatic.com", "googleusercontent.com", "apple.com", "cloudflare.com", "challenges.cloudflare.com")
-
-
-def claude_url(q=""):
-    return "https://claude.ai/new" + (("?q=" + urllib.parse.quote(q)) if q else "")
-
-
-_WEB = {}
-
-
-def web_engine():
-    """Встроенный браузер Qt (QtWebEngine) или None."""
-    if "mod" not in _WEB:
-        try:
-            from PySide6 import QtWebEngineCore, QtWebEngineWidgets
-            _WEB["mod"] = (QtWebEngineCore, QtWebEngineWidgets)
-        except Exception:
-            _WEB["mod"] = None
-    return _WEB["mod"]
-
-
-class ClaudePanel(QWidget):
-    """Окошко с claude.ai рядом с виджетом. Профиль браузера свой и сохраняется - входить нужно один раз."""
-
-    def __init__(self, mgr):
-        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint |
-                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        core, widgets = web_engine()
-        self.mgr = mgr
-        self.setWindowTitle("Claude")
-        self.resize(460, 680)
-        self.setStyleSheet("QWidget#bar { background: #262624; } QLabel { color: #F5F4EF; font-size: 13px; "
-                           "font-weight: 600; } QPushButton { color: #F5F4EF; background: transparent; border: none;"
-                           " font-size: 15px; padding: 4px 9px; border-radius: 6px; }"
-                           " QPushButton:hover { background: rgba(255,255,255,0.12); }")
-        from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QHBoxLayout
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        bar = QWidget(self)
-        bar.setObjectName("bar")
-        bar.setFixedHeight(36)
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(12, 0, 6, 0)
-        bl.addWidget(QLabel("Claude"))
-        bl.addStretch(1)
-        self.b_new = QPushButton("+")
-        self.b_new.setToolTip("Новый чат")
-        self.b_ext = QPushButton("↗")
-        self.b_ext.setToolTip("Открыть в браузере")
-        self.b_pin = QPushButton("📌")
-        self.b_pin.setToolTip("Не скрывать, когда щёлкаешь в другом месте")
-        self.b_pin.setCheckable(True)
-        self.b_close = QPushButton("✕")
-        self.b_close.setToolTip("Скрыть (Esc)")
-        for b in (self.b_new, self.b_ext, self.b_pin, self.b_close):
-            bl.addWidget(b)
-        lay.addWidget(bar)
-        self.bar = bar
-        self.profile = core.QWebEngineProfile("snowwidgets-claude", self)
-        store = os.path.join(DATA_DIR, "web")
-        self.profile.setPersistentStoragePath(store)
-        self.profile.setCachePath(os.path.join(store, "cache"))
-        self.profile.setPersistentCookiesPolicy(core.QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-        import re
-        ua = re.sub(r"\s*QtWebEngine/\S+", "", self.profile.httpUserAgent())   # обычный Chrome, а не "QtWebEngine"
-        self.profile.setHttpUserAgent(ua)
-        panel = self
-
-        class Page(core.QWebEnginePage):
-            def acceptNavigationRequest(self, url, nav_type, is_main):
-                host = url.host().lower()
-                if url.scheme() in ("http", "https") and host and not any(
-                        host == h or host.endswith("." + h) for h in CLAUDE_WEB_HOSTS):
-                    QDesktopServices.openUrl(url)          # посторонние ссылки - в обычный браузер
-                    return False
-                return super().acceptNavigationRequest(url, nav_type, is_main)
-
-            def createWindow(self, _type):
-                tmp = core.QWebEnginePage(panel.profile, panel)
-                tmp.urlChanged.connect(lambda u, t=tmp: (QDesktopServices.openUrl(u), t.deleteLater()))
-                return tmp
-
-        self.view = widgets.QWebEngineView(self)
-        self.page = Page(self.profile, self.view)
-        self.view.setPage(self.page)
-        self.view.setZoomFactor(0.9)
-        lay.addWidget(self.view, 1)
-        self.b_new.clicked.connect(lambda: self.open(claude_url()))
-        self.b_ext.clicked.connect(lambda: QDesktopServices.openUrl(self.view.url()))
-        self.b_close.clicked.connect(self.hide)
-        self._drag = None
-
-    def open(self, url, near=None):
-        self.view.setUrl(QUrl(url))
-        if near is not None and not self.isVisible():
-            scr = QApplication.screenAt(near.center()) or QApplication.primaryScreen()
-            a = scr.availableGeometry()
-            x = near.left() - self.width() - 8 if near.left() - self.width() - 8 >= a.left() else near.right() + 8
-            x = max(a.left(), min(x, a.right() - self.width()))
-            y = max(a.top(), min(near.top(), a.bottom() - self.height()))
-            self.move(x, y)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.view.setFocus()
-
-    def keyPressEvent(self, ev):
-        if ev.key() == Qt.Key.Key_Escape:
-            self.hide()
-        else:
-            super().keyPressEvent(ev)
-
-    def changeEvent(self, ev):
-        super().changeEvent(ev)
-        if ev.type() == ev.Type.ActivationChange and not self.isActiveWindow() and not self.b_pin.isChecked():
-            QTimer.singleShot(150, lambda: (not self.isActiveWindow() and QApplication.activePopupWidget() is None
-                                            and QApplication.activeModalWidget() is None and self.hide()))
-
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton and ev.position().y() <= self.bar.height():
-            self._drag = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, ev):
-        if self._drag is not None:
-            self.move(ev.globalPosition().toPoint() - self._drag)
-
-    def mouseReleaseEvent(self, ev):
-        self._drag = None
-
-
 KINDS = {c.KIND: c for c in (WeatherCard, MusicCard, BatteryCard, PhotoCard, CalendarCard, ClockCard,
-                                SystemCard, ClaudeCard, NotifyCard, DiscordCard)}
+                                SystemCard)}
 
 
 # ---------------------------------------------------------------------------
@@ -4605,27 +3609,18 @@ class Manager(QObject):
                 if data["style"] not in STYLES:
                     data["style"] = "dark"
                 data.setdefault("widgets", [])
+                data["widgets"] = [w for w in data["widgets"] if w.get("kind") in KINDS]
+                data.pop("claude_key", None)
+                for junk in ("web", "wpn_copy"):
+                    shutil.rmtree(os.path.join(DATA_DIR, junk), ignore_errors=True)
+                try:
+                    os.remove(os.path.join(DATA_DIR, "notifications.json"))
+                except OSError:
+                    pass
                 return data
         except Exception:
             pass
         return {"style": "dark", "opacity": 1.0, "locked": False, "animations": True, "widgets": []}
-
-    def notify(self):
-        if getattr(self, "_notify", None) is None:
-            self._notify = NotifyService()
-        return self._notify
-
-    def claude_panel(self):
-        """Окошко claude.ai (одно на все виджеты Claude) или None, если встроенного браузера нет."""
-        if getattr(self, "_claude_panel", None) is None:
-            if web_engine() is None:
-                return None
-            try:
-                self._claude_panel = ClaudePanel(self)
-            except Exception:
-                traceback.print_exc()
-                self._claude_panel = False
-        return self._claude_panel or None
 
     def media(self):
         """Общий опрос плеера (создаётся, когда появляется первый виджет музыки)."""
@@ -4865,10 +3860,6 @@ class Manager(QObject):
     def quit(self):
         self._save_timer.stop()
         self._write()
-        pan = getattr(self, "_claude_panel", None)
-        if pan:                                   # страница браузера должна закрыться раньше своего профиля
-            pan.view.setPage(None)
-            pan.page.deleteLater()
         if self.tray is not None:
             self.tray.hide()
         self.app.quit()
@@ -4878,7 +3869,6 @@ def main():
     if not single_instance():
         msgbox("Виджеты уже запущены - ищи значок в трее (возле часов).")
         return 0
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)   # для встроенного браузера
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)

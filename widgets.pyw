@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -446,6 +446,27 @@ class WinHid:
             _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p), ("Offset", DWORD),
                         ("OffsetHigh", DWORD), ("hEvent", HANDLE)]
 
+        class HIDP_VALUE_CAPS(ctypes.Structure):
+            _fields_ = [("UsagePage", ctypes.c_ushort), ("ReportID", ctypes.c_ubyte), ("IsAlias", ctypes.c_ubyte),
+                        ("BitField", ctypes.c_ushort), ("LinkCollection", ctypes.c_ushort),
+                        ("LinkUsage", ctypes.c_ushort), ("LinkUsagePage", ctypes.c_ushort),
+                        ("IsRange", ctypes.c_ubyte), ("IsStringRange", ctypes.c_ubyte),
+                        ("IsDesignatorRange", ctypes.c_ubyte), ("IsAbsolute", ctypes.c_ubyte),
+                        ("HasNull", ctypes.c_ubyte), ("Reserved", ctypes.c_ubyte), ("BitSize", ctypes.c_ushort),
+                        ("ReportCount", ctypes.c_ushort), ("Reserved2", ctypes.c_ushort * 5),
+                        ("UnitsExp", ctypes.c_ulong), ("Units", ctypes.c_ulong), ("LogicalMin", ctypes.c_long),
+                        ("LogicalMax", ctypes.c_long), ("PhysicalMin", ctypes.c_long), ("PhysicalMax", ctypes.c_long),
+                        ("UsageMin", ctypes.c_ushort), ("UsageMax", ctypes.c_ushort), ("Rest", ctypes.c_ushort * 6)]
+
+        self.HIDP_VALUE_CAPS = HIDP_VALUE_CAPS
+        hid.HidP_GetValueCaps.argtypes = [ctypes.c_int, ctypes.POINTER(HIDP_VALUE_CAPS),
+                                          ctypes.POINTER(ctypes.c_ushort), ctypes.c_void_p]
+        hid.HidP_GetValueCaps.restype = ctypes.c_long
+        hid.HidP_GetUsageValue.argtypes = [ctypes.c_int, ctypes.c_ushort, ctypes.c_ushort, ctypes.c_ushort,
+                                           ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p, ctypes.c_void_p, ULONG]
+        hid.HidP_GetUsageValue.restype = ctypes.c_long
+        hid.HidD_GetInputReport.argtypes = [HANDLE, ctypes.c_void_p, ULONG]
+        hid.HidD_GetInputReport.restype = BOOL
         self.SP_DEVICE_INTERFACE_DATA, self.HIDD_ATTRIBUTES = SP_DEVICE_INTERFACE_DATA, HIDD_ATTRIBUTES
         self.HIDP_CAPS, self.OVERLAPPED = HIDP_CAPS, OVERLAPPED
         hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
@@ -520,6 +541,57 @@ class WinHid:
                     "in_len": caps.InputReportByteLength, "out_len": caps.OutputReportByteLength,
                     "feat_len": caps.FeatureReportByteLength}
         finally:
+            self.k32.CloseHandle(h)
+
+    # Поля "заряд батареи" из стандарта HID: Battery Strength (страница 0x06, поле 0x20) и
+    # Absolute State Of Charge / Remaining Capacity (страница 0x85). Их сообщают многие беспроводные
+    # мыши и клавиатуры без фирменного протокола - Linux так и показывает их заряд, а Windows - нет.
+    BATTERY_USAGES = {(0x06, 0x20), (0x85, 0x65), (0x85, 0x66)}
+
+    def battery_usage(self, info):
+        """Процент заряда из стандартного поля HID или None."""
+        h = self._open(info["path"], 0)
+        if h is None:
+            return None
+        pp = ctypes.c_void_p()
+        try:
+            if not self.hid.HidD_GetPreparsedData(h, ctypes.byref(pp)):
+                return None
+            caps = self.HIDP_CAPS()
+            self.hid.HidP_GetCaps(pp, ctypes.byref(caps))
+            for rtype, count, length, getter in ((2, caps.Counts[8], caps.FeatureReportByteLength,
+                                                  self.hid.HidD_GetFeature),
+                                                 (0, caps.Counts[2], caps.InputReportByteLength,
+                                                  self.hid.HidD_GetInputReport)):
+                if not count or not length:
+                    continue
+                arr = (self.HIDP_VALUE_CAPS * count)()
+                n = ctypes.c_ushort(count)
+                if self.hid.HidP_GetValueCaps(rtype, arr, ctypes.byref(n), pp) != 0x00110000:
+                    continue
+                for vc in arr[:n.value]:
+                    if (vc.UsagePage, vc.UsageMin) not in self.BATTERY_USAGES:
+                        continue
+                    buf = ctypes.create_string_buffer(length)
+                    buf[0] = bytes([vc.ReportID])
+                    if not getter(h, buf, length):
+                        continue
+                    val = ctypes.c_ulong(0)
+                    if self.hid.HidP_GetUsageValue(rtype, vc.UsagePage, vc.LinkCollection, vc.UsageMin,
+                                                   ctypes.byref(val), pp, buf, length) != 0x00110000:
+                        continue
+                    lo, hi = vc.LogicalMin, vc.LogicalMax
+                    v = val.value
+                    if hi > lo:
+                        pct = (v - lo) * 100.0 / (hi - lo)
+                    else:
+                        pct = float(v)
+                    if 0 < pct <= 100:
+                        return int(round(pct))
+            return None
+        finally:
+            if pp:
+                self.hid.HidD_FreePreparsedData(pp)
             self.k32.CloseHandle(h)
 
     # ----- как в hidapi -----
@@ -922,6 +994,43 @@ def scan_mice():
     return out
 
 
+def hid_std_batteries(skip_vids=(0x046D, 0x1532)):
+    """Заряд из стандартных полей HID у всех остальных устройств (только Windows)."""
+    api = _hid_module()
+    if not isinstance(api, WinHid):
+        return []
+    out, done = [], set()
+    try:
+        infos = api.enumerate()
+    except Exception:
+        return []
+    for info in infos:
+        key = (info["vendor_id"], info["product_id"])
+        if info["vendor_id"] in skip_vids or key in done:
+            continue
+        try:
+            pct = api.battery_usage(info)
+        except Exception:
+            pct = None
+        if pct is None:
+            continue
+        done.add(key)
+        same = [i for i in infos if (i["vendor_id"], i["product_id"]) == key]
+        name = next((i["product_string"] for i in same if i["product_string"]), "") or "Беспроводное устройство"
+        usages = {(i["usage_page"], i["usage"]) for i in same}
+        if (1, 2) in usages:
+            kind = "mouse"
+        elif (1, 6) in usages:
+            kind = "keyboard"
+        else:
+            kind = guess_kind(name)
+        if name.lower() in ("usb receiver", "2.4g wireless receiver", "wireless receiver", "usb dongle"):
+            brand = HID_BRANDS.get(key[0], "приёмник 2.4G").split(" (")[0]
+            name = ("Мышь" if kind == "mouse" else "Устройство") + " " + brand
+        out.append({"name": name, "level": pct, "kind": kind, "charging": False})
+    return out
+
+
 def read_devices():
     if DEMO:
         return [{"name": "MX Master 3S", "level": 64, "kind": "mouse", "charging": False},
@@ -931,7 +1040,7 @@ def read_devices():
                 {"name": "Этот компьютер", "level": 81, "kind": "laptop", "charging": True}]
     devs, seen = [], set()
     notes = []
-    for d in logi_batteries() + razer_batteries(notes) + [
+    for d in logi_batteries() + razer_batteries(notes) + hid_std_batteries() + [
             {"name": n, "level": lv, "kind": guess_kind(n), "charging": False} for n, lv in bt_batteries()]:
         if d["name"].lower() not in seen:
             seen.add(d["name"].lower())
@@ -3263,6 +3372,85 @@ def _secs(v):
         return 0.0
 
 
+def _cover_path(title, artist):
+    import hashlib
+    h = hashlib.md5(("%s|%s" % (artist.strip().lower(), title.strip().lower())).encode("utf-8")).hexdigest()
+    return os.path.join(DATA_DIR, "covers", h + ".jpg")
+
+
+def cover_from_cache(title, artist):
+    p = _cover_path(title, artist)
+    if os.path.exists(p):
+        img = QImage(p)
+        if not img.isNull():
+            return img
+    return None
+
+
+def _norm(t):
+    import re
+    return re.sub(r"[^0-9a-zа-яё]+", " ", (t or "").lower()).strip()
+
+
+def _similar(a, b):
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
+        return False
+    return a in b or b in a or len(set(a.split()) & set(b.split())) >= max(1, min(len(a.split()), 2) // 2)
+
+
+def cover_online(title, artist, log=None):
+    """Обложка по названию и исполнителю: Яндекс Музыка, потом iTunes, потом Deezer. Сохраняется на диск."""
+    q = urllib.parse.quote(("%s %s" % (artist, title)).strip())
+    found = []
+    try:
+        j = http_json("https://api.music.yandex.net/search?type=track&page=0&text=" + q, 8)
+        for t in ((j.get("result") or {}).get("tracks") or {}).get("results") or []:
+            uri = t.get("coverUri") or ((t.get("albums") or [{}])[0].get("coverUri"))
+            names = " ".join(a.get("name", "") for a in t.get("artists") or [])
+            if uri:
+                found.append((t.get("title"), names, "https://" + uri.replace("%%", "400x400")))
+    except Exception as ex:
+        log and log("обложка (Яндекс): %r" % (ex,))
+    if not found:
+        try:
+            j = http_json("https://itunes.apple.com/search?entity=song&limit=5&term=" + q, 8)
+            for t in j.get("results") or []:
+                if t.get("artworkUrl100"):
+                    found.append((t.get("trackName"), t.get("artistName"),
+                                  t["artworkUrl100"].replace("100x100bb", "600x600bb")))
+        except Exception as ex:
+            log and log("обложка (iTunes): %r" % (ex,))
+    if not found:
+        try:
+            j = http_json("https://api.deezer.com/search?limit=5&q=" + q, 8)
+            for t in j.get("data") or []:
+                url = (t.get("album") or {}).get("cover_xl") or (t.get("album") or {}).get("cover_big")
+                if url:
+                    found.append((t.get("title"), (t.get("artist") or {}).get("name"), url))
+        except Exception as ex:
+            log and log("обложка (Deezer): %r" % (ex,))
+    # сначала совпадение и по названию, и по исполнителю, потом хотя бы по исполнителю, потом первое
+    pick = next((f for f in found if _similar(f[0], title) and _similar(f[1], artist)), None) or \
+        next((f for f in found if _similar(f[1], artist) or not artist), None) or (found[0] if found else None)
+    if pick is None:
+        return None
+    try:
+        req = urllib.request.Request(pick[2], headers=UA)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = r.read()
+        img = QImage.fromData(data)
+        if img.isNull():
+            return None
+        p = _cover_path(title, artist)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        img.save(p, "JPG", 92)
+        return img
+    except Exception as ex:
+        log and log("обложка (загрузка): %r" % (ex,))
+        return None
+
+
 def media_key(name):
     """Запасной вариант управления: мультимедийные клавиши (работают с любым плеером)."""
     vk = {"toggle": 0xB3, "next": 0xB0, "prev": 0xB1}.get(name)
@@ -3302,6 +3490,7 @@ class MediaService(QObject):
         self._got.connect(self._on)
         self._demo_play = True
         self.gen = 0
+        self._covers = {}
         self.reason = None
         self.need_winrt = False
         self.last_payload = time.time()
@@ -3396,29 +3585,55 @@ class MediaService(QObject):
             pass
 
     async def _thumb(self, props, ss):
+        """Обложка, которую плеер передал Windows (пробуем три способа прочитать поток)."""
         import asyncio
-        try:
-            ref = props.thumbnail
-            if ref is None:
-                return None
-            stream = await asyncio.wait_for(ref.open_read_async(), 4)
-            size = int(stream.size)
-            if not size or size > 20 * 1024 * 1024:
-                return None
-            buf = ss.Buffer(size)
-            res = await asyncio.wait_for(stream.read_async(buf, size, ss.InputStreamOptions.READ_AHEAD), 4)
-            try:
-                data = bytes(memoryview(res))
-            except Exception:
-                reader = ss.DataReader.from_buffer(res)
-                arr = bytearray(res.length)
-                reader.read_bytes(arr)
-                data = bytes(arr)
-            img = QImage.fromData(data)
-            return None if img.isNull() else img
-        except Exception as ex:
-            self.log("обложка: %r" % (ex,))
+        ref = getattr(props, "thumbnail", None)
+        if ref is None:
             return None
+        errors = []
+        for way in (1, 2, 3):
+            try:
+                stream = await asyncio.wait_for(ref.open_read_async(), 4)
+                size = int(stream.size)
+                if not size or size > 20 * 1024 * 1024:
+                    return None
+                if way == 3:                                 # через DataReader поверх потока
+                    reader = ss.DataReader(stream)
+                    await asyncio.wait_for(reader.load_async(size), 4)
+                    arr = bytearray(size)
+                    reader.read_bytes(arr)
+                    data = bytes(arr)
+                else:
+                    buf = ss.Buffer(size)
+                    res = await asyncio.wait_for(stream.read_async(buf, size, ss.InputStreamOptions.READ_AHEAD), 4)
+                    if way == 1:
+                        data = bytes(memoryview(res))
+                    else:
+                        reader = ss.DataReader.from_buffer(res)
+                        arr = bytearray(res.length)
+                        reader.read_bytes(arr)
+                        data = bytes(arr)
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    return img
+                errors.append("способ %d: картинка не распознана" % way)
+            except Exception as ex:
+                errors.append("способ %d: %r" % (way, ex))
+        self.log("обложка из Windows не прочиталась: " + "; ".join(errors))
+        return None
+
+    def _fetch_cover(self, key, title, artist):
+        if key in getattr(self, "_fetching", set()):
+            return
+        self._fetching = getattr(self, "_fetching", set()) | {key}
+
+        def work():
+            img = cover_online(title, artist, self.log)
+            if img is not None:
+                self._covers[key] = img
+                self._emit({"cover_for": key, "img": img})
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _log_sessions(self, mgr, why):
         now = time.time()
@@ -3511,6 +3726,12 @@ class MediaService(QObject):
                         if key != last_key:
                             last_key = key
                             cover = await self._thumb(props, ss)
+                            if cover is None:
+                                cover = cover_from_cache(title, props.artist or "")
+                            if cover is None:
+                                self._fetch_cover(key, title, props.artist or props.album_artist or "")
+                        if cover is None:
+                            cover = self._covers.get(key)
                         pos = _secs(tl.position) - _secs(tl.start_time)
                         try:
                             lu = tl.last_updated_time
@@ -3545,6 +3766,11 @@ class MediaService(QObject):
                 self.dead_since = time.time()
             self.need_winrt = bool(payload.get("need_winrt"))
             self.updated.emit()
+            return
+        if "cover_for" in payload:                         # обложка нашлась в интернете
+            if self.state and self.state.get("key") == payload["cover_for"] and self.state.get("cover") is None:
+                self.state = dict(self.state, cover=payload["img"])
+                self.updated.emit()
             return
         self.error = None
         st = payload["state"]
@@ -3747,6 +3973,11 @@ class MusicCard(Card):
             rnd = random.Random(str(key))                  # "форма волны" у каждого трека своя
             self.shape = [0.45 + 0.55 * (0.5 + 0.5 * math.sin(i * 0.37 + rnd.random() * 6)) * rnd.uniform(0.6, 1.0)
                           for i in range(120)]
+        elif (st or {}).get("cover") is not self.cover:   # обложка пришла позже (нашлась в интернете)
+            self.cover = (st or {}).get("cover")
+            self.prev_blur = self.blur
+            self._prepare()
+            self.fade_t0 = time.time() if self.animated else 0.0
         self.update()
 
     def _prepare(self):

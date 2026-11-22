@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.11"
+APP_VERSION = "1.12"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -588,6 +588,135 @@ def logi_batteries():
     return out
 
 
+# ----- Razer: протокол открыт проектом OpenRazer (отчёты по 90 байт через HID feature report) -----
+RAZER_VID = 0x1532
+
+
+def _razer_report(tid, cls, cmd, size, args=()):
+    r = bytearray(90)
+    r[1], r[5], r[6], r[7] = tid, size, cls, cmd
+    for i, a in enumerate(args):
+        r[8 + i] = a
+    crc = 0
+    for b in r[2:88]:
+        crc ^= b
+    r[88] = crc
+    return r
+
+
+def _razer_query(dev, cls, cmd, size=0x02):
+    """Ответ мыши (90 байт) или None. Разные модели ждут разный "transaction id" - пробуем по очереди."""
+    for tid in (0x1F, 0xFF, 0x3F, 0x08):
+        try:
+            dev.send_feature_report([0x00] + list(_razer_report(tid, cls, cmd, size)))
+        except Exception:
+            return None                              # этот интерфейс команды не принимает
+        for _ in range(4):
+            time.sleep(0.06)
+            try:
+                data = list(dev.get_feature_report(0x00, 91) or [])
+            except Exception:
+                return None
+            if len(data) == 91:
+                data = data[1:]
+            if len(data) < 90:
+                continue
+            if data[0] == 0x01:                      # мышь занята - подождём
+                continue
+            if data[0] == 0x02 and data[6] == cls and data[7] == cmd:
+                return data
+            break                                    # "не поддерживается" - пробуем другой id
+    return None
+
+
+def razer_batteries(report=None):
+    hid = _hid_module()
+    if hid is None:
+        return []
+    out, done = [], set()
+    try:
+        infos = hid.enumerate(RAZER_VID, 0)
+    except Exception:
+        return []
+    for d in infos:
+        pid = d.get("product_id")
+        if pid in done:
+            continue
+        dev = None
+        try:
+            dev = hid.device()
+            dev.open_path(d["path"])
+            r = _razer_query(dev, 0x07, 0x80)        # уровень заряда 0..255
+            if r is None:
+                continue
+            done.add(pid)
+            ch = _razer_query(dev, 0x07, 0x84)       # заряжается?
+            level, charging = int(round(r[9] * 100 / 255.0)), bool(ch and ch[9])
+            name = (d.get("product_string") or "Мышь Razer").strip()
+            if level == 0 and not charging:
+                if report is not None:
+                    report.append("%s: ответила 0%% - скорее всего, мышь спит или выключена" % name)
+                continue
+            kind = guess_kind(name)
+            out.append({"name": name, "level": level, "kind": "mouse" if kind == "bluetooth" else kind,
+                        "charging": charging})
+        except Exception:
+            continue
+        finally:
+            try:
+                if dev is not None:
+                    dev.close()
+            except Exception:
+                pass
+    return out
+
+
+# ----- какие мыши вообще подключены (чтобы честно сказать, можно ли узнать заряд) -----
+HID_BRANDS = {0x046D: "Logitech", 0x1532: "Razer", 0x1038: "SteelSeries", 0x1B1C: "Corsair", 0x0951: "HyperX",
+              0x03F0: "HyperX", 0x0B05: "ASUS ROG", 0x258A: "SinoWealth (Glorious, Redragon, Defender и др.)",
+              0x09DA: "A4Tech / Bloody", 0x3554: "VGN / VXE", 0x373B: "ATK / VXE", 0x1EA7: "приёмник 2.4G без фирмы",
+              0x248A: "приёмник 2.4G без фирмы", 0x25A7: "приёмник 2.4G без фирмы", 0x1D57: "приёмник 2.4G без фирмы",
+              0x30FA: "приёмник 2.4G без фирмы", 0x18F8: "приёмник 2.4G без фирмы", 0x04D9: "Holtek",
+              0x093A: "PixArt", 0x2EA8: "Defender", 0x045E: "Microsoft", 0x17EF: "Lenovo", 0x413C: "Dell",
+              0x1A81: "Holtek", 0x2717: "Xiaomi", 0x1BCF: "Sunplus"}
+BATTERY_BRANDS = {0x046D, 0x1532}                    # чей протокол заряда виджет знает
+
+
+def scan_mice():
+    """[{brand, name, vid, pid, wireless, supported}] - мыши и радио-приёмники, которые видит Windows."""
+    hid = _hid_module()
+    if hid is None:
+        return None
+    try:
+        infos = hid.enumerate(0, 0)
+    except Exception:
+        return None
+    seen = {}
+    for d in infos:
+        vid, pid = d.get("vendor_id", 0), d.get("product_id", 0)
+        name = (d.get("product_string") or "").strip()
+        is_mouse = d.get("usage_page") == 1 and d.get("usage") == 2
+        low = name.lower()
+        wireless = any(w in low for w in ("wireless", "receiver", "dongle", "2.4", "unifying", "lightspeed",
+                                          "bolt", "hyperspeed", "беспровод", "nano", "usb receiver"))
+        if not (is_mouse or wireless):
+            continue
+        key = (vid, pid)
+        e = seen.setdefault(key, {"vid": vid, "pid": pid, "name": name, "wireless": False, "mouse": False})
+        e["name"] = e["name"] or name
+        e["wireless"] |= wireless
+        e["mouse"] |= is_mouse
+    out = []
+    for e in seen.values():
+        if not e["mouse"] and not e["wireless"]:
+            continue
+        e["brand"] = HID_BRANDS.get(e["vid"], "неизвестная фирма")
+        e["supported"] = e["vid"] in BATTERY_BRANDS
+        out.append(e)
+    out.sort(key=lambda e: (not e["wireless"], not e["supported"]))
+    return out
+
+
 def read_devices():
     if DEMO:
         return [{"name": "MX Master 3S", "level": 64, "kind": "mouse", "charging": False},
@@ -596,8 +725,9 @@ def read_devices():
                 {"name": "Xbox Wireless Controller", "level": 12, "kind": "gamepad", "charging": False},
                 {"name": "Этот компьютер", "level": 81, "kind": "laptop", "charging": True}]
     devs, seen = [], set()
-    for d in logi_batteries() + [{"name": n, "level": lv, "kind": guess_kind(n), "charging": False}
-                                 for n, lv in bt_batteries()]:
+    notes = []
+    for d in logi_batteries() + razer_batteries(notes) + [
+            {"name": n, "level": lv, "kind": guess_kind(n), "charging": False} for n, lv in bt_batteries()]:
         if d["name"].lower() not in seen:
             seen.add(d["name"].lower())
             devs.append(d)
@@ -606,7 +736,11 @@ def read_devices():
     pc = pc_battery()
     if pc:
         devs.append(pc)
+    _BATT_NOTES[:] = notes
     return devs
+
+
+_BATT_NOTES = []
 
 
 class BatteryService(QObject):
@@ -616,6 +750,8 @@ class BatteryService(QObject):
     def __init__(self):
         super().__init__()
         self.devices, self.stamp, self._busy = [], None, False
+        self.mice = None                       # что за мыши подключены (None - не удалось узнать)
+        self.notes = []
         self._done.connect(self._finish)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -632,13 +768,19 @@ class BatteryService(QObject):
         try:
             devs = read_devices()
         except Exception:
+            log_error("чтение заряда")
             devs = None
         try:
-            self._done.emit(devs)      # сигнал доставится в главный поток
+            mice = [] if DEMO else scan_mice()
+        except Exception:
+            mice = None
+        try:
+            self._done.emit((devs, mice, list(_BATT_NOTES)))      # сигнал доставится в главный поток
         except RuntimeError:
             pass
 
-    def _finish(self, devs):
+    def _finish(self, res):
+        devs, self.mice, self.notes = res
         self._busy = False
         if devs is not None:
             self.devices, self.stamp = devs, datetime.datetime.now()
@@ -1831,13 +1973,7 @@ class BatteryCard(Card):
         size = self.cfg["size"]
         if not devs:
             draw_icon(p, "mouse", r.center().x(), r.y() + (r.height() * 0.28 if size != "s" else 46), 30, th["fg2"])
-            if self.mgr.battery.stamp is None:
-                msg = "Ищу устройства..."
-            elif size == "s":
-                msg = "Нет устройств\nс известным зарядом"
-            else:
-                msg = ("Нет устройств с известным зарядом.\nПоддерживаются Bluetooth и радио-мыши Logitech\n"
-                       "(Unifying, Bolt, Lightspeed).")
+            msg = self.mouse_hint(size == "s")
             p.setFont(font(12))
             p.setPen(th["fg2"])
             p.drawText(QRectF(r.x() + 12, r.y() + r.height() * (0.45 if size != "s" else 0.5), r.width() - 24,
@@ -1890,8 +2026,54 @@ class BatteryCard(Card):
             p.drawEllipse(QPointF(cx + rad * 0.72, cy - rad * 0.72), rad * 0.28, rad * 0.28)
             draw_bolt(p, cx + rad * 0.72, cy - rad * 0.72, rad * 0.4, self.ring_col(GREEN))
 
+    def mouse_hint(self, short):
+        b = self.mgr.battery
+        if b.stamp is None:
+            return "Ищу устройства..."
+        if b.mice is None:
+            return ("Ставлю компонент hidapi для радио-мышей..." if not FROZEN else "Не удалось опросить USB-устройства")
+        if b.notes:
+            return b.notes[0]
+        radio = [m for m in b.mice if m["wireless"]] or b.mice
+        if not radio:
+            return "Нет устройств с известным зарядом" if short else \
+                "Нет устройств с известным зарядом.\nПодключи приёмник мыши в USB."
+        m = radio[0]
+        name = m["name"] or "мышь"
+        if m["supported"]:
+            return ("%s: пошевели мышь" % m["brand"]) if short else \
+                ("%s (%s)\nМышь не ответила - пошевели её, она могла уснуть." % (name, m["brand"]))
+        if short:
+            return "%s: заряд не передаётся" % m["brand"].split(" (")[0]
+        return ("%s - %s.\nЭта фирма не сообщает заряд компьютеру напрямую, его показывает только её "
+                "программа. Нажми правой кнопкой → «Какие мыши видит программа»." % (name, m["brand"]))
+
+    def mice_report(self):
+        b = self.mgr.battery
+        lines = ["Версия виджетов: %s" % APP_VERSION, ""]
+        if b.mice is None:
+            lines.append("USB-устройства опросить не удалось (нет компонента hidapi).")
+        elif not b.mice:
+            lines.append("Мышей и радио-приёмников не найдено.")
+        for m in b.mice or []:
+            lines.append("%s | %s | VID %04X PID %04X | %s | заряд: %s" % (
+                m["name"] or "(без названия)", m["brand"], m["vid"], m["pid"],
+                "радио/беспроводная" if m["wireless"] else "мышь", "умею читать" if m["supported"] else "не умею"))
+        for n in b.notes:
+            lines.append(n)
+        lines += ["", "Заряд найден у: " + (", ".join("%s %d%%" % (d["name"], d["level"]) for d in b.devices)
+                                           or "ни у кого")]
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(QMessageBox.Icon.Information, "Батарея - какие мыши видит программа", "\n".join(lines))
+        copy = box.addButton("Скопировать", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is copy:
+            QApplication.clipboard().setText("\n".join(lines))
+
     def extra_menu(self, menu):
         menu.addAction("Обновить сейчас").triggered.connect(self.mgr.battery.refresh)
+        menu.addAction("Какие мыши видит программа...").triggered.connect(self.mice_report)
         devs = self.mgr.battery.devices
         if devs:
             sm = menu.addMenu("Главное устройство")

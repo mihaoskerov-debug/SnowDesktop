@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.12"
+APP_VERSION = "1.13"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -415,29 +415,234 @@ def volt_to_pct(mv):
     return 0
 
 
+class WinHid:
+    """Доступ к USB HID-устройствам через hid.dll и setupapi.dll самой Windows - без библиотеки hidapi.
+    Повторяет ту часть интерфейса hidapi, что нужна виджету: enumerate() и device()."""
+
+    def __init__(self):
+        from ctypes import wintypes as W
+        self.W = W
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hid = ctypes.WinDLL("hid", use_last_error=True)
+        sa = ctypes.WinDLL("setupapi", use_last_error=True)
+        HANDLE, BOOL, DWORD, ULONG = ctypes.c_void_p, W.BOOL, W.DWORD, W.ULONG
+        self.INVALID = ctypes.c_void_p(-1).value
+
+        class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+            _fields_ = [("cbSize", DWORD), ("InterfaceClassGuid", GUID), ("Flags", DWORD),
+                        ("Reserved", ctypes.c_void_p)]
+
+        class HIDD_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Size", ULONG), ("VendorID", ctypes.c_ushort), ("ProductID", ctypes.c_ushort),
+                        ("VersionNumber", ctypes.c_ushort)]
+
+        class HIDP_CAPS(ctypes.Structure):
+            _fields_ = [("Usage", ctypes.c_ushort), ("UsagePage", ctypes.c_ushort),
+                        ("InputReportByteLength", ctypes.c_ushort), ("OutputReportByteLength", ctypes.c_ushort),
+                        ("FeatureReportByteLength", ctypes.c_ushort), ("Reserved", ctypes.c_ushort * 17),
+                        ("Counts", ctypes.c_ushort * 10)]
+
+        class OVERLAPPED(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p), ("Offset", DWORD),
+                        ("OffsetHigh", DWORD), ("hEvent", HANDLE)]
+
+        self.SP_DEVICE_INTERFACE_DATA, self.HIDD_ATTRIBUTES = SP_DEVICE_INTERFACE_DATA, HIDD_ATTRIBUTES
+        self.HIDP_CAPS, self.OVERLAPPED = HIDP_CAPS, OVERLAPPED
+        hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
+        hid.HidD_GetHidGuid.restype = None
+        hid.HidD_GetAttributes.argtypes = [HANDLE, ctypes.POINTER(HIDD_ATTRIBUTES)]
+        hid.HidD_GetAttributes.restype = BOOL
+        hid.HidD_GetProductString.argtypes = [HANDLE, ctypes.c_void_p, ULONG]
+        hid.HidD_GetProductString.restype = BOOL
+        hid.HidD_GetPreparsedData.argtypes = [HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+        hid.HidD_GetPreparsedData.restype = BOOL
+        hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+        hid.HidD_FreePreparsedData.restype = BOOL
+        hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
+        hid.HidP_GetCaps.restype = ctypes.c_long
+        hid.HidD_SetFeature.argtypes = [HANDLE, ctypes.c_void_p, ULONG]
+        hid.HidD_SetFeature.restype = BOOL
+        hid.HidD_GetFeature.argtypes = [HANDLE, ctypes.c_void_p, ULONG]
+        hid.HidD_GetFeature.restype = BOOL
+        sa.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), W.LPCWSTR, W.HWND, DWORD]
+        sa.SetupDiGetClassDevsW.restype = HANDLE
+        sa.SetupDiEnumDeviceInterfaces.argtypes = [HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID), DWORD,
+                                                   ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)]
+        sa.SetupDiEnumDeviceInterfaces.restype = BOOL
+        sa.SetupDiGetDeviceInterfaceDetailW.argtypes = [HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+                                                        ctypes.c_void_p, DWORD, ctypes.POINTER(DWORD), ctypes.c_void_p]
+        sa.SetupDiGetDeviceInterfaceDetailW.restype = BOOL
+        sa.SetupDiDestroyDeviceInfoList.argtypes = [HANDLE]
+        sa.SetupDiDestroyDeviceInfoList.restype = BOOL
+        k32.CreateFileW.argtypes = [W.LPCWSTR, DWORD, DWORD, ctypes.c_void_p, DWORD, DWORD, HANDLE]
+        k32.CreateFileW.restype = HANDLE
+        k32.CloseHandle.argtypes = [HANDLE]
+        k32.CloseHandle.restype = BOOL
+        k32.CreateEventW.argtypes = [ctypes.c_void_p, BOOL, BOOL, W.LPCWSTR]
+        k32.CreateEventW.restype = HANDLE
+        k32.WriteFile.argtypes = [HANDLE, ctypes.c_void_p, DWORD, ctypes.c_void_p, ctypes.POINTER(OVERLAPPED)]
+        k32.WriteFile.restype = BOOL
+        k32.ReadFile.argtypes = [HANDLE, ctypes.c_void_p, DWORD, ctypes.c_void_p, ctypes.POINTER(OVERLAPPED)]
+        k32.ReadFile.restype = BOOL
+        k32.WaitForSingleObject.argtypes = [HANDLE, DWORD]
+        k32.WaitForSingleObject.restype = DWORD
+        k32.GetOverlappedResult.argtypes = [HANDLE, ctypes.POINTER(OVERLAPPED), ctypes.POINTER(DWORD), BOOL]
+        k32.GetOverlappedResult.restype = BOOL
+        k32.CancelIoEx.argtypes = [HANDLE, ctypes.POINTER(OVERLAPPED)]
+        k32.CancelIoEx.restype = BOOL
+        self.k32, self.hid, self.sa = k32, hid, sa
+
+    # ----- служебное -----
+    def _open(self, path, access):
+        h = self.k32.CreateFileW(path, access, 0x1 | 0x2, None, 3, 0x40000000, None)   # SHARE_RW, OPEN_EXISTING,
+        return None if h in (None, self.INVALID) else h                                 # FILE_FLAG_OVERLAPPED
+
+    def _info(self, path):
+        h = self._open(path, 0)                         # без прав чтения: так можно спросить даже мышь/клавиатуру
+        if h is None:
+            return None
+        try:
+            at = self.HIDD_ATTRIBUTES()
+            at.Size = ctypes.sizeof(at)
+            if not self.hid.HidD_GetAttributes(h, ctypes.byref(at)):
+                return None
+            buf = ctypes.create_unicode_buffer(128)
+            name = buf.value if self.hid.HidD_GetProductString(h, buf, ctypes.sizeof(buf)) else ""
+            caps = self.HIDP_CAPS()
+            pp = ctypes.c_void_p()
+            if self.hid.HidD_GetPreparsedData(h, ctypes.byref(pp)):
+                try:
+                    self.hid.HidP_GetCaps(pp, ctypes.byref(caps))
+                finally:
+                    self.hid.HidD_FreePreparsedData(pp)
+            return {"path": path, "vendor_id": at.VendorID, "product_id": at.ProductID, "product_string": name,
+                    "usage_page": caps.UsagePage, "usage": caps.Usage, "interface_number": -1,
+                    "in_len": caps.InputReportByteLength, "out_len": caps.OutputReportByteLength,
+                    "feat_len": caps.FeatureReportByteLength}
+        finally:
+            self.k32.CloseHandle(h)
+
+    # ----- как в hidapi -----
+    def enumerate(self, vid=0, pid=0):
+        guid = GUID()
+        self.hid.HidD_GetHidGuid(ctypes.byref(guid))
+        hdev = self.sa.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x12)   # PRESENT | DEVICEINTERFACE
+        if hdev in (None, self.INVALID):
+            return []
+        out = []
+        try:
+            i = 0
+            while True:
+                ifd = self.SP_DEVICE_INTERFACE_DATA()
+                ifd.cbSize = ctypes.sizeof(ifd)
+                if not self.sa.SetupDiEnumDeviceInterfaces(hdev, None, ctypes.byref(guid), i, ctypes.byref(ifd)):
+                    break
+                i += 1
+                need = self.W.DWORD(0)
+                self.sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(ifd), None, 0, ctypes.byref(need), None)
+                if not need.value:
+                    continue
+                buf = ctypes.create_string_buffer(need.value + 4)
+                ctypes.memmove(buf, ctypes.byref(self.W.DWORD(8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6)), 4)
+                if not self.sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(ifd), buf, need.value, None, None):
+                    continue
+                path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+                try:
+                    info = self._info(path)
+                except Exception:
+                    info = None
+                if info and (not vid or info["vendor_id"] == vid) and (not pid or info["product_id"] == pid):
+                    out.append(info)
+        finally:
+            self.sa.SetupDiDestroyDeviceInfoList(hdev)
+        return out
+
+    def device(self):
+        return _WinHidDevice(self)
+
+
+class _WinHidDevice:
+    def __init__(self, api):
+        self.api, self.h, self.info = api, None, None
+
+    def open_path(self, path):
+        api = self.api
+        if isinstance(path, bytes):
+            path = path.decode("utf-8", "replace")
+        self.info = api._info(path) or {"in_len": 64, "out_len": 64, "feat_len": 91}
+        self.h = api._open(path, 0x80000000 | 0x40000000) or api._open(path, 0)   # чтение+запись, иначе без прав
+        if self.h is None:
+            raise OSError("не открыть HID-устройство")
+
+    def close(self):
+        if self.h is not None:
+            self.api.k32.CloseHandle(self.h)
+            self.h = None
+
+    def _io(self, fn, buf, size, timeout_ms):
+        api = self.api
+        ov = api.OVERLAPPED()
+        ov.hEvent = api.k32.CreateEventW(None, True, False, None)
+        try:
+            ok = fn(self.h, buf, size, None, ctypes.byref(ov))
+            if not ok and ctypes.get_last_error() != 997:            # ERROR_IO_PENDING
+                return -1
+            if api.k32.WaitForSingleObject(ov.hEvent, max(1, int(timeout_ms))) != 0:
+                api.k32.CancelIoEx(self.h, ctypes.byref(ov))
+            n = api.W.DWORD(0)
+            if not api.k32.GetOverlappedResult(self.h, ctypes.byref(ov), ctypes.byref(n), True):
+                return -1
+            return n.value
+        finally:
+            api.k32.CloseHandle(ov.hEvent)
+
+    def write(self, data):
+        size = max(len(data), self.info.get("out_len") or 0)
+        buf = ctypes.create_string_buffer(bytes(bytearray(data)) + bytes(size - len(data)), size)
+        if self._io(self.api.k32.WriteFile, buf, size, 1000) < 0:
+            raise OSError("запись в HID не удалась")
+        return size
+
+    def read(self, max_length, timeout_ms=0):
+        size = max(max_length, self.info.get("in_len") or 0)
+        buf = ctypes.create_string_buffer(size)
+        n = self._io(self.api.k32.ReadFile, buf, size, timeout_ms or 1)
+        return list(bytearray(buf.raw[:n])) if n > 0 else []
+
+    def send_feature_report(self, data):
+        size = max(len(data), self.info.get("feat_len") or 0)
+        buf = ctypes.create_string_buffer(bytes(bytearray(data)) + bytes(size - len(data)), size)
+        if not self.api.hid.HidD_SetFeature(self.h, buf, size):
+            raise OSError("feature report не принят")
+        return size
+
+    def get_feature_report(self, report_id, max_length):
+        size = max(max_length, self.info.get("feat_len") or 0)
+        buf = ctypes.create_string_buffer(size)
+        buf[0] = bytes([report_id])
+        if not self.api.hid.HidD_GetFeature(self.h, buf, size):
+            raise OSError("feature report не прочитан")
+        return list(bytearray(buf.raw[:max_length]))
+
+
 def _hid_module():
-    """Модуль hidapi; при запуске из .pyw ставим его сам один раз, если его нет."""
+    """Доступ к HID-устройствам. В Windows - напрямую через системные hid.dll/setupapi.dll (ничего не
+    нужно ставить). В других системах - библиотека hidapi, если она есть."""
     if _HID_STATE["mod"] is not None:
         return _HID_STATE["mod"]
+    if IS_WIN:
+        try:
+            _HID_STATE["mod"] = WinHid()
+            return _HID_STATE["mod"]
+        except Exception:
+            log_error("доступ к HID через Windows")
+            _HID_STATE["error"] = "не удалось открыть hid.dll"
     try:
         import hid
         _HID_STATE["mod"] = hid
         return hid
     except ImportError:
-        pass
-    if IS_WIN and not FROZEN and not _HID_STATE["tried_install"]:
-        _HID_STATE["tried_install"] = True
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "hidapi"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=NO_WINDOW, timeout=300)
-            importlib.invalidate_caches()
-            import hid
-            _HID_STATE["mod"] = hid
-            return hid
-        except Exception:
-            pass
-    return None
+        return None
 
 
 class HidPP:
@@ -773,6 +978,7 @@ class BatteryService(QObject):
         try:
             mice = [] if DEMO else scan_mice()
         except Exception:
+            log_error("поиск мышей")
             mice = None
         try:
             self._done.emit((devs, mice, list(_BATT_NOTES)))      # сигнал доставится в главный поток
@@ -2031,7 +2237,7 @@ class BatteryCard(Card):
         if b.stamp is None:
             return "Ищу устройства..."
         if b.mice is None:
-            return ("Ставлю компонент hidapi для радио-мышей..." if not FROZEN else "Не удалось опросить USB-устройства")
+            return "Не удалось опросить USB-устройства (подробности - в widgets_error.log)"
         if b.notes:
             return b.notes[0]
         radio = [m for m in b.mice if m["wireless"]] or b.mice
@@ -2052,7 +2258,7 @@ class BatteryCard(Card):
         b = self.mgr.battery
         lines = ["Версия виджетов: %s" % APP_VERSION, ""]
         if b.mice is None:
-            lines.append("USB-устройства опросить не удалось (нет компонента hidapi).")
+            lines.append("USB-устройства опросить не удалось: %s" % (_HID_STATE.get("error") or "см. widgets_error.log"))
         elif not b.mice:
             lines.append("Мышей и радио-приёмников не найдено.")
         for m in b.mice or []:

@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.14"
+APP_VERSION = "1.15"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -1756,6 +1756,8 @@ class Card(QWidget):
 
     # ----- рисование -----
     def paintEvent(self, _ev):
+        if "_av" not in self.__dict__:          # окно ещё не до конца создано или уже удаляется
+            return
         self._last_paint = time.time()
         try:
             self._paint_frame()
@@ -3451,6 +3453,341 @@ def cover_online(title, artist, log=None):
         return None
 
 
+# ----- обложки своих музыкальных файлов (MP3, FLAC, M4A): из самого файла или картинки рядом -----
+AUDIO_EXT = {".mp3", ".flac", ".m4a", ".mp4", ".aac", ".alac", ".ogg", ".opus", ".wma", ".wav"}
+FOLDER_IMAGES = ("cover", "folder", "front", "album", "albumart", "обложка")
+
+
+def _syncsafe(b):
+    return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
+
+
+def _id3_text(body):
+    if not body:
+        return ""
+    enc, data = body[0], body[1:]
+    try:
+        if enc == 0:
+            t = data.decode("latin-1")
+        elif enc == 1:
+            t = data.decode("utf-16")
+        elif enc == 2:
+            t = data.decode("utf-16-be")
+        else:
+            t = data.decode("utf-8")
+    except Exception:
+        return ""
+    return t.replace("\x00", " ").strip()
+
+
+def _apic_image(body, v22=False):
+    """Картинка из кадра APIC (ID3 2.3/2.4) или PIC (2.2): (тип картинки, байты)."""
+    try:
+        enc = body[0]
+        if v22:
+            ptype, i = body[4], 5
+        else:
+            m = body.index(b"\x00", 1)
+            ptype, i = body[m + 1], m + 2
+        rest = body[i:]
+        if enc in (1, 2):                              # описание в UTF-16 - конец на двух нулях
+            k = 0
+            while k + 1 < len(rest) and rest[k:k + 2] != b"\x00\x00":
+                k += 2
+            return ptype, rest[k + 2:]
+        j = rest.index(b"\x00")
+        return ptype, rest[j + 1:]
+    except Exception:
+        return None, None
+
+
+def read_id3(path, want_pic=False):
+    """(название, исполнитель, картинка) из ID3-тега MP3. Большие кадры без нужды не читаем - перескакиваем."""
+    with open(path, "rb") as f:
+        head = f.read(10)
+        if len(head) < 10 or head[:3] != b"ID3":
+            return None
+        ver, flags, size = head[3], head[5], _syncsafe(head[6:10])
+        if flags & 0x80 or ver < 3:                    # редкие варианты - читаем тег целиком
+            data = f.read(size)
+            if flags & 0x80:
+                data = data.replace(b"\xff\x00", b"\xff")
+            return _id3_parse_mem(data, ver, flags, want_pic)
+        end = 10 + size
+        if flags & 0x40:                               # расширенный заголовок
+            eh = f.read(4)
+            f.seek((_syncsafe(eh) if ver == 4 else int.from_bytes(eh, "big") + 4) - 4, 1)
+        title = artist = None
+        pic, pic_type = None, None
+        while f.tell() + 10 <= end:
+            fh = f.read(10)
+            fid = fh[:4]
+            if not fid.strip(b"\x00") or not fid.isalnum():
+                break
+            fsize = _syncsafe(fh[4:8]) if ver == 4 else int.from_bytes(fh[4:8], "big")
+            if fsize <= 0 or f.tell() + fsize > end:
+                break
+            if fid in (b"TIT2", b"TPE1", b"TPE2") or (want_pic and fid == b"APIC"):
+                body = f.read(fsize)
+                if fid == b"TIT2":
+                    title = _id3_text(body)
+                elif fid == b"TPE1":
+                    artist = _id3_text(body)
+                elif fid == b"TPE2" and not artist:
+                    artist = _id3_text(body)
+                elif fid == b"APIC":
+                    ptype, img = _apic_image(body)
+                    if img and (pic is None or (ptype == 3 and pic_type != 3)):   # 3 - лицевая обложка
+                        pic, pic_type = img, ptype
+            else:
+                f.seek(fsize, 1)
+        return title, artist, pic
+
+
+def _id3_parse_mem(data, ver, flags, want_pic):
+    title = artist = pic = None
+    pos, hdr = 0, (10 if ver >= 3 else 6)
+    while pos + hdr <= len(data):
+        if ver >= 3:
+            fid = data[pos:pos + 4]
+            fsize = _syncsafe(data[pos + 4:pos + 8]) if ver == 4 else int.from_bytes(data[pos + 4:pos + 8], "big")
+        else:
+            fid = data[pos:pos + 3]
+            fsize = int.from_bytes(data[pos + 3:pos + 6], "big")
+        if not fid.strip(b"\x00") or fsize <= 0:
+            break
+        body = data[pos + hdr:pos + hdr + fsize]
+        pos += hdr + fsize
+        if fid in (b"TIT2", b"TT2"):
+            title = _id3_text(body)
+        elif fid in (b"TPE1", b"TP1"):
+            artist = _id3_text(body)
+        elif want_pic and pic is None and fid in (b"APIC", b"PIC"):
+            pic = _apic_image(body, v22=(fid == b"PIC"))[1]
+    return title, artist, pic
+
+
+def read_flac(path, want_pic=False):
+    title = artist = pic = None
+    with open(path, "rb") as f:
+        if f.read(4) != b"fLaC":
+            return None
+        while True:
+            h = f.read(4)
+            if len(h) < 4:
+                break
+            last, btype, ln = h[0] & 0x80, h[0] & 0x7F, int.from_bytes(h[1:4], "big")
+            if btype == 4:                             # Vorbis comment - теги
+                b = f.read(ln)
+                try:
+                    p = 4 + int.from_bytes(b[0:4], "little")
+                    n = int.from_bytes(b[p:p + 4], "little")
+                    p += 4
+                    for _ in range(n):
+                        cl = int.from_bytes(b[p:p + 4], "little")
+                        kv = b[p + 4:p + 4 + cl].decode("utf-8", "replace")
+                        p += 4 + cl
+                        k, _s, v = kv.partition("=")
+                        if k.upper() == "TITLE":
+                            title = v
+                        elif k.upper() == "ARTIST" and not artist:
+                            artist = v
+                except Exception:
+                    pass
+            elif btype == 6 and want_pic and pic is None:   # картинка
+                b = f.read(ln)
+                try:
+                    p = 4
+                    p += 4 + int.from_bytes(b[p:p + 4], "big")
+                    p += 4 + int.from_bytes(b[p:p + 4], "big") + 16
+                    plen = int.from_bytes(b[p:p + 4], "big")
+                    pic = b[p + 4:p + 4 + plen]
+                except Exception:
+                    pass
+            else:
+                f.seek(ln, 1)
+            if last:
+                break
+    return title, artist, pic
+
+
+def _mp4_item(buf, name):
+    i = buf.find(name)
+    if i < 0:
+        return None
+    j = buf.find(b"data", i, i + 32)
+    if j < 4:
+        return None
+    size = int.from_bytes(buf[j - 4:j], "big")
+    return buf[j + 12:j - 4 + size]
+
+
+def read_mp4(path, want_pic=False):
+    if os.path.getsize(path) > 60 * 1024 * 1024:
+        return None
+    with open(path, "rb") as f:
+        buf = f.read()
+    dec = lambda b: b.decode("utf-8", "replace").strip() if b else None
+    return dec(_mp4_item(buf, b"\xa9nam")), dec(_mp4_item(buf, b"\xa9ART")), \
+        (_mp4_item(buf, b"covr") if want_pic else None)
+
+
+def read_tags(path, want_pic=False):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".mp3":
+            return read_id3(path, want_pic)
+        if ext == ".flac":
+            return read_flac(path, want_pic)
+        if ext in (".m4a", ".mp4", ".aac", ".alac"):
+            return read_mp4(path, want_pic)
+    except Exception:
+        return None
+    return None
+
+
+def file_cover(path):
+    """Обложка музыкального файла: встроенная в файл, иначе cover.jpg / folder.jpg рядом с ним."""
+    t = read_tags(path, want_pic=True)
+    if t and t[2]:
+        img = QImage.fromData(t[2])
+        if not img.isNull():
+            return img
+    d = os.path.dirname(path)
+    try:
+        pics = [f for f in os.listdir(d) if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")]
+    except Exception:
+        pics = []
+    pics.sort(key=lambda f: (not any(os.path.splitext(f)[0].lower().startswith(n) for n in FOLDER_IMAGES), f))
+    stem = _norm(os.path.splitext(os.path.basename(path))[0])
+    for f in pics:
+        low = os.path.splitext(f)[0].lower()
+        if any(low.startswith(n) for n in FOLDER_IMAGES) or _norm(low) == stem or len(pics) == 1:
+            img = QImage(os.path.join(d, f))
+            if not img.isNull():
+                return img
+    return None
+
+
+def music_folders(extra=()):
+    loc = QStandardPaths.StandardLocation
+    home = os.path.expanduser("~")
+    cands = list(extra) + [QStandardPaths.writableLocation(loc.MusicLocation) or os.path.join(home, "Music"),
+                           QStandardPaths.writableLocation(loc.DownloadLocation) or os.path.join(home, "Downloads"),
+                           QStandardPaths.writableLocation(loc.DesktopLocation) or os.path.join(home, "Desktop")]
+    od = os.environ.get("OneDrive")
+    if od:
+        cands += [os.path.join(od, "Music"), os.path.join(od, "Музыка")]
+    if IS_WIN:
+        for letter in "CDEFGH":
+            for name in ("Music", "Музыка", "MP3", "Mp3"):
+                cands.append("%s:\\%s" % (letter, name))
+    out, seen = [], set()
+    for c in cands:
+        if c and os.path.isdir(c):
+            k = os.path.normcase(os.path.realpath(c))
+            if k not in seen:
+                seen.add(k)
+                out.append(c)
+    return out
+
+
+class MusicIndex:
+    """Список своих музыкальных файлов с названиями из тегов (запоминается в music_index.json)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.files = {}              # путь -> (mtime, нормализованное название, нормализованный исполнитель)
+        self.built = 0.0
+        self.path = os.path.join(DATA_DIR, "music_index.json")
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                self.files = {k: tuple(v) for k, v in json.load(fh).items()}
+        except Exception:
+            pass
+
+    def rebuild(self, folders, log=None):
+        found, fresh = {}, 0
+        for root_dir in folders:
+            for root, dirs, files in os.walk(root_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ("node_modules", "$recycle.bin")]
+                for fn in files:
+                    if os.path.splitext(fn)[1].lower() not in AUDIO_EXT:
+                        continue
+                    p = os.path.join(root, fn)
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    old = self.files.get(p)
+                    if old and old[0] == mt:
+                        found[p] = old
+                        continue
+                    t = read_tags(p) or (None, None, None)
+                    found[p] = (mt, _norm(t[0]), _norm(t[1]))
+                    fresh += 1
+                    if len(found) > 40000:
+                        break
+        with self.lock:
+            self.files = found
+            self.built = time.time()
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump(found, fh, ensure_ascii=False)
+        except Exception:
+            pass
+        if log:
+            log("музыкальные файлы: %d (новых или изменённых %d) в %d папках" % (len(found), fresh, len(folders)))
+
+    def find(self, title, artist):
+        nt, na = _norm(title), _norm(artist)
+        if not nt:
+            return None
+        best, best_score = None, 0
+        with self.lock:
+            items = list(self.files.items())
+        for p, (_mt, tt, ta) in items:
+            stem = _norm(os.path.splitext(os.path.basename(p))[0])
+            score = 0
+            if tt and tt == nt:
+                score += 6
+            elif tt and (nt in tt or tt in nt):
+                score += 3
+            elif nt in stem:
+                score += 3
+            else:
+                continue
+            if na:
+                if ta and (ta == na or na in ta or ta in na):
+                    score += 4
+                elif na in stem or na in _norm(os.path.dirname(p)):
+                    score += 3
+            if score > best_score:
+                best, best_score = p, score
+        return best if best_score >= 3 else None
+
+
+_MUSIC_INDEX = None
+
+
+def local_cover(title, artist, extra_folders=(), log=None):
+    """Найти на компьютере файл, который играет, и достать его обложку."""
+    global _MUSIC_INDEX
+    if _MUSIC_INDEX is None:
+        _MUSIC_INDEX = MusicIndex()
+    idx = _MUSIC_INDEX
+    path = idx.find(title, artist)
+    if (path is None or not os.path.exists(path)) and time.time() - idx.built > 120:
+        idx.rebuild(music_folders(extra_folders), log)          # файла нет в списке - пересканируем папки
+        path = idx.find(title, artist)
+    if path is None:
+        return None
+    img = file_cover(path)
+    if img is None and log:
+        log("в файле %s нет обложки и рядом нет картинки" % os.path.basename(path))
+    return img
+
+
 def media_key(name):
     """Запасной вариант управления: мультимедийные клавиши (работают с любым плеером)."""
     vk = {"toggle": 0xB3, "next": 0xB0, "prev": 0xB1}.get(name)
@@ -3628,7 +3965,20 @@ class MediaService(QObject):
         self._fetching = getattr(self, "_fetching", set()) | {key}
 
         def work():
-            img = cover_online(title, artist, self.log)
+            img = None
+            try:
+                img = local_cover(title, artist, self.mgr.cfg.get("music_dirs") or (), self.log)
+            except Exception as ex:
+                self.log("обложка из файла: %r" % (ex,))
+            if img is not None:
+                try:
+                    p = _cover_path(title, artist)
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    img.save(p, "JPG", 92)
+                except Exception:
+                    pass
+            else:
+                img = cover_online(title, artist, self.log)
             if img is not None:
                 self._covers[key] = img
                 self._emit({"cover_for": key, "img": img})
@@ -4360,6 +4710,19 @@ class MusicCard(Card):
         self._pip_timer.timeout.connect(check)
         self._pip_timer.start(1000)
 
+    def add_music_dir(self):
+        d = QFileDialog.getExistingDirectory(None, "Папка, где лежат твои MP3 (оттуда возьмутся обложки)",
+                                             (self.mgr.cfg.get("music_dirs") or [""])[0])
+        if d:
+            dirs = [x for x in (self.mgr.cfg.get("music_dirs") or []) if os.path.normcase(x) != os.path.normcase(d)]
+            self.mgr.set_opt("music_dirs", [os.path.normpath(d)] + dirs[:9])
+            if _MUSIC_INDEX is not None:
+                _MUSIC_INDEX.built = 0.0                       # пересканировать при следующем треке
+            self.media._fetching = set()
+            st = self.media.state
+            if st and st.get("cover") is None and st.get("title"):
+                self.media._fetch_cover(st["key"], st["title"], st.get("artist", ""))
+
     def diagnose(self):
         st = self.media.state or {}
         peak = _METER.peak()
@@ -4375,6 +4738,8 @@ class MusicCard(Card):
                  "Режим пластинки: %s" % ("всегда" if self.cfg.get("spin") == "always" else "когда играет"),
                  "Ошибка связи с плеером: %s" % (self.media.error or "нет"),
                  "Почему нет названия: %s" % (self.media.reason or "-"),
+                 "Обложка: %s" % ("есть" if st.get("cover") is not None else "нет"),
+                 "Папки с музыкой: %s" % (", ".join(music_folders(self.mgr.cfg.get("music_dirs") or ())) or "-"),
                  "Плееры, которые знает Windows: %s" % (", ".join(getattr(self.media, "session_names", []) or [])
                                                          or "ни одного"),
                  "", "Журналы: " + DATA_DIR]
@@ -4392,6 +4757,7 @@ class MusicCard(Card):
         a.setCheckable(True)
         a.setChecked(self.cfg.get("spin") == "always")
         a.toggled.connect(lambda v: self.set_opt("spin", "always" if v else None))
+        menu.addAction("Папка с моей музыкой (для обложек)...").triggered.connect(self.add_music_dir)
         menu.addAction("Диагностика...").triggered.connect(self.diagnose)
 
 

@@ -34,7 +34,7 @@ import urllib.request
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "SnowWidgets"
-APP_VERSION = "1.15"
+APP_VERSION = "1.16"
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = "--demo" in sys.argv            # тестовые данные вместо настоящих устройств и погоды
@@ -3669,10 +3669,88 @@ def file_cover(path):
     return None
 
 
+PLAYER_HINTS = ("mpthree",)          # плееры, которые сами качают треки на диск (с тегами и обложками)
+
+
+def player_dirs():
+    """Папки программ-плееров вроде mpthree: в AppData, LocalAppData, Музыке, Документах, Загрузках."""
+    home = os.path.expanduser("~")
+    loc = QStandardPaths.StandardLocation
+    bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"),
+             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages"),
+             QStandardPaths.writableLocation(loc.MusicLocation), QStandardPaths.writableLocation(loc.DocumentsLocation),
+             QStandardPaths.writableLocation(loc.DownloadLocation), home]
+    out = []
+    for b in bases:
+        if not b or not os.path.isdir(b):
+            continue
+        try:
+            names = os.listdir(b)
+        except OSError:
+            continue
+        for n in names:
+            if any(h in n.lower() for h in PLAYER_HINTS):
+                p = os.path.join(b, n)
+                if os.path.isdir(p) and p not in out:
+                    out.append(p)
+    return out
+
+
+_RECENT = {"t": 0.0, "path": None}
+
+
+def recent_player_file(max_age=20 * 60):
+    """Самый свежий аудиофайл в папках плееров (его, скорее всего, и играют сейчас) или None."""
+    now = time.time()
+    if now - _RECENT["t"] < 5:
+        return _RECENT["path"]
+    best, best_t = None, now - max_age
+    for d in player_dirs():
+        count = 0
+        for root, dirs, files in os.walk(d):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() not in AUDIO_EXT:
+                    continue
+                count += 1
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                t = max(st.st_mtime, st.st_atime)
+                if t > best_t:
+                    best, best_t = p, t
+            if count > 20000:
+                break
+    _RECENT.update(t=now, path=best)
+    return best
+
+
+_FILE_TRACK = {}
+
+
+def file_track(path):
+    """(название, исполнитель, обложка) играющего файла - из тегов, иначе из имени файла."""
+    if path in _FILE_TRACK:
+        return _FILE_TRACK[path]
+    t = read_tags(path) or (None, None, None)
+    title, artist = t[0], t[1]
+    if not title:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if " - " in stem:
+            artist, title = [x.strip() for x in stem.split(" - ", 1)]
+        else:
+            title = stem
+    res = (title, artist or "", file_cover(path))
+    _FILE_TRACK.clear() if len(_FILE_TRACK) > 50 else None
+    _FILE_TRACK[path] = res
+    return res
+
+
 def music_folders(extra=()):
     loc = QStandardPaths.StandardLocation
     home = os.path.expanduser("~")
-    cands = list(extra) + [QStandardPaths.writableLocation(loc.MusicLocation) or os.path.join(home, "Music"),
+    cands = list(extra) + player_dirs() + [QStandardPaths.writableLocation(loc.MusicLocation) or os.path.join(home, "Music"),
                            QStandardPaths.writableLocation(loc.DownloadLocation) or os.path.join(home, "Downloads"),
                            QStandardPaths.writableLocation(loc.DesktopLocation) or os.path.join(home, "Desktop")]
     od = os.environ.get("OneDrive")
@@ -3801,7 +3879,7 @@ def media_key(name):
 
 def app_title(aumid):
     a = (aumid or "").lower()
-    for key, title in (("music.yandex", "Яндекс Музыка"), ("yandexmusic", "Яндекс Музыка"),
+    for key, title in (("mpthree", "mpthree"), ("music.yandex", "Яндекс Музыка"), ("yandexmusic", "Яндекс Музыка"),
                        ("yandex.music", "Яндекс Музыка"), ("яндекс", "Яндекс Музыка"), ("yandex", "Яндекс"), ("spotify", "Spotify"), ("chrome", "Браузер Chrome"),
                        ("msedge", "Браузер Edge"), ("firefox", "Браузер Firefox"), ("opera", "Браузер Opera"),
                        ("browser", "Яндекс Браузер"), ("vk", "VK Музыка"), ("zune", "Музыка Windows"),
@@ -4323,7 +4401,7 @@ class MusicCard(Card):
             rnd = random.Random(str(key))                  # "форма волны" у каждого трека своя
             self.shape = [0.45 + 0.55 * (0.5 + 0.5 * math.sin(i * 0.37 + rnd.random() * 6)) * rnd.uniform(0.6, 1.0)
                           for i in range(120)]
-        elif (st or {}).get("cover") is not self.cover:   # обложка пришла позже (нашлась в интернете)
+        elif st is not None and st.get("cover") is not self.cover:   # обложка пришла позже (нашлась в интернете)
             self.cover = (st or {}).get("cover")
             self.prev_blur = self.blur
             self._prepare()
@@ -4607,11 +4685,23 @@ class MusicCard(Card):
             if pk is not None and pk > 0.02:
                 self._sound_t = time.time()
             if time.time() - getattr(self, "_sound_t", 0) < 3.0:
-                # звук идёт, а название Windows не отдала - всё равно показываем живую пластинку
-                why = self.media.reason or self.media.error or "название трека не пришло от плеера"
-                st = {"title": "Играет музыка", "artist": why, "album": "",
-                      "app": "", "playing": True, "pos": 0.0, "dur": 0.0, "stamp": time.time(), "cover": None,
-                      "key": None, "status": 4}
+                # звук идёт, а название Windows не отдала. Если это плеер вроде mpthree, который сам качает
+                # треки на диск, - берём самый свежий файл из его папки; иначе просто живая пластинка
+                path = recent_player_file()
+                if path:
+                    title, artist, cover = file_track(path)
+                    st = {"title": title, "artist": artist, "album": "", "app": "mpthree", "playing": True,
+                          "pos": 0.0, "dur": 0.0, "stamp": time.time(), "cover": cover, "key": None, "status": 4}
+                    if cover is not self.cover:
+                        self.cover = cover
+                        self.prev_blur = self.blur
+                        self._prepare()
+                        self.fade_t0 = time.time() if self.animated else 0.0
+                else:
+                    why = self.media.reason or self.media.error or "название трека не пришло от плеера"
+                    st = {"title": "Играет музыка", "artist": why, "album": "",
+                          "app": "", "playing": True, "pos": 0.0, "dur": 0.0, "stamp": time.time(), "cover": None,
+                          "key": None, "status": 4}
         generic = bool(st) and st.get("key") is None and self.media.state is None
         if generic:
             r0 = self.card_rect()
@@ -4739,6 +4829,8 @@ class MusicCard(Card):
                  "Ошибка связи с плеером: %s" % (self.media.error or "нет"),
                  "Почему нет названия: %s" % (self.media.reason or "-"),
                  "Обложка: %s" % ("есть" if st.get("cover") is not None else "нет"),
+                 "Папки плееров (mpthree): %s" % (", ".join(player_dirs()) or "не найдены"),
+                 "Свежий файл в них: %s" % (recent_player_file() or "нет"),
                  "Папки с музыкой: %s" % (", ".join(music_folders(self.mgr.cfg.get("music_dirs") or ())) or "-"),
                  "Плееры, которые знает Windows: %s" % (", ".join(getattr(self.media, "session_names", []) or [])
                                                          or "ни одного"),
